@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - zod@4.6.7
