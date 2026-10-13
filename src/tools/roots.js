@@ -4,12 +4,18 @@ import { z } from 'zod';
 import { Out, defineTool } from './base.js';
 import { toPosix } from '../util.js';
 
+/**
+ * 探测一个目录当前是否可读，结果直接写进给 AI 的清单里。
+ * @param {string} dir
+ * @returns {Promise<string>}
+ */
 async function probe(dir) {
   try {
     const st = await fsp.stat(dir);
     if (!st.isDirectory()) return `不是目录（${st.isFile() ? '文件' : '其它'}）`;
   } catch (err) {
-    return err.code === 'ENOENT' ? '不存在' : `不可访问(${err.code})`;
+    const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+    return code === 'ENOENT' ? '不存在' : `不可访问(${code})`;
   }
   try {
     const h = await fsp.opendir(dir);
@@ -22,7 +28,7 @@ async function probe(dir) {
       await h.close().catch(() => {});
     }
   } catch (err) {
-    return `权限不足(${err.code})`;
+    return `权限不足(${/** @type {NodeJS.ErrnoException} */ (err).code})`;
   }
 }
 

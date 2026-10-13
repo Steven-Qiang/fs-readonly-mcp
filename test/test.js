@@ -11,6 +11,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT = path.resolve(HERE, '..');
 const PORT = Number(process.env.TEST_PORT || 8000 + Math.floor(Math.random() * 900));
 const TOKEN = 'test-token-please-change';
+const LONG = 1024 * 1024 + 4096; // 超过单行 1MB 上限，用来验证超长行处理
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let passed = 0;
@@ -128,11 +129,17 @@ async function main() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'fsmcp-test-'));
   const auditFile = path.join(root, 'audit.ndjson');
   const fixtures = await makeFixtures(root);
-  // 白名单外的哨兵文件：用来证明「配了 roots 会被拦 / 不配 roots 全盘可读」
+  // 白名单外的哨兵文件：用来证明「配了 roots 会被拦」
   const outsideFile = path.join(os.tmpdir(), `fsmcp-outside-${Date.now()}.log`);
   await fsp.writeFile(outsideFile, 'outside-marker-line\n', 'utf8');
+  // 「不配 roots」的默认可见范围 = 当前盘（POSIX 上是 /）。这台机器上临时目录在 C 盘、
+  // 项目在 D 盘，所以要在项目所在盘放一个哨兵，才能验证默认范围确实放开了一整个盘。
+  const projectVolumeRoot = path.parse(PROJECT).root;
+  const volumeSentinel = path.join(projectVolumeRoot, `fsmcp-volume-sentinel-${Date.now()}.log`);
+  await fsp.writeFile(volumeSentinel, 'volume-marker-line\n', 'utf8');
   console.log(`临时目录: ${root}`);
-  console.log(`服务端口: ${PORT}\n`);
+  console.log(`服务端口: ${PORT}`);
+  console.log(`当前盘哨兵: ${volumeSentinel}\n`);
 
   const child = spawn(process.execPath, [path.join(PROJECT, 'src', 'server.js')], {
     env: {
@@ -156,6 +163,7 @@ async function main() {
     if (child.exitCode === null) child.kill('SIGKILL');
     await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
     await fsp.rm(outsideFile, { force: true }).catch(() => {});
+    await fsp.rm(volumeSentinel, { force: true }).catch(() => {});
   };
 
   try {
@@ -194,6 +202,14 @@ async function main() {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
       });
       assert(res.status === 401, `状态码 ${res.status}`);
+    });
+
+    await check('token 不接受 query string（会进 access log）', async () => {
+      const res = await request('POST', `/mcp?token=${encodeURIComponent(TOKEN)}`, {
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'initialize', params: {} }),
+      });
+      assert(res.status === 401, `query 里的 token 不该被接受，实际状态码 ${res.status}`);
     });
 
     await check('token 不对也是 401', async () => {
@@ -500,17 +516,51 @@ async function main() {
       assertMatch(res.result.content[0].text, /projA/, '结果内容');
     });
 
-    await check('服务端进程全程没有改过业务目录', async () => {
-      const entries = (await fsp.readdir(fixtures.logsA)).sort();
-      assert(
-        JSON.stringify(entries) === JSON.stringify(['app.log', 'big.log', 'binary.bin', 'error.log']),
-        `目录内容被改了：${JSON.stringify(entries)}`,
-      );
+    await check('超长行（>1MB）不丢行、行号不错位（回归：曾经整行被静默丢弃）', async () => {
+      const big2 = path.join(fixtures.logsA, 'longline.log');
+      const h = await fsp.open(big2, 'w');
+      const junk = 'x'.repeat(Math.floor(LONG / 2));
+      await h.write('head1\n');
+      await h.write(junk);
+      await h.write(junk);
+      await h.write('\ntail3\n');
+      await h.close();
+
+      const { text } = await callTool('cat', { path: 'logs/longline.log', project: 'projA', limit: 10 });
+      assertMatch(text, /1\| head1/, '第一行');
+      assertMatch(text, /2\|/, '超长行必须出现（不能被丢掉）');
+      assertMatch(text, /3\| tail3/, '超长行后面那行的行号必须是 3（差 1 就是错位）');
+      assertMatch(text, /超过|已截断/, '必须提示超长行被截断');
     });
 
-    // 另起一个「不配 MCP_ROOTS」的实例：默认应当是整个文件系统可读
-    console.log('\n— 不配 MCP_ROOTS（默认全盘可读） —');
-    await check('未配 roots 时，任意绝对路径都可读', async () => {
+    await check('超长行之后分片续读能推进（不会死循环）', async () => {
+      const big3 = path.join(fixtures.logsA, 'longline2.log');
+      const h = await fsp.open(big3, 'w');
+      await h.write('a1\n');
+      await h.write('y'.repeat(LONG + 100));
+      await h.write('\nafter-long\nlast-line\n');
+      await h.close();
+
+      const first = await callTool('cat', { path: 'logs/longline2.log', project: 'projA', limit: 1 });
+      const m = /offset=(\d+)/.exec(first.text);
+      assert(m, '第一片要给 nextOffset：' + first.text.slice(0, 200));
+      const next = Number(m[1]);
+      assert(next > 0, 'nextOffset 必须前进');
+      const second = await callTool('cat', { path: 'logs/longline2.log', project: 'projA', offset: next, limit: 2 });
+      assertMatch(second.text, /2\|/, '续读要从第 2 行（超长行）开始');
+      const m2 = /offset=(\d+)/.exec(second.text);
+      if (m2) assert(Number(m2[1]) > next, '第二片的 nextOffset 必须比第一片大，否则会死循环');
+    });
+
+    await check('服务端进程全程没有改过业务目录', async () => {
+      const entries = (await fsp.readdir(fixtures.logsA)).sort();
+      const expected = ['app.log', 'big.log', 'binary.bin', 'error.log', 'longline.log', 'longline2.log'];
+      assert(JSON.stringify(entries) === JSON.stringify(expected), `目录内容被改了：${JSON.stringify(entries)}`);
+    });
+
+    // 另起一个「不配 MCP_ROOTS」的实例：默认范围应当是「当前盘」（POSIX 上是 /）
+    console.log('\n— 不配 MCP_ROOTS（默认当前盘可读） —');
+    await check('未配 roots 时，当前盘内任意绝对路径都可读', async () => {
       const port2 = PORT + 7;
       const env2 = { ...process.env, MCP_PORT: String(port2), MCP_HOST: '127.0.0.1', MCP_TOKEN: TOKEN };
       // 关键：删掉继承来的 MCP_ROOTS，才能验证「不配 roots」的默认行为
@@ -545,40 +595,61 @@ async function main() {
           `默认根目录应是文件系统根，实际 ${health.roots[0].dirs[0]}`,
         );
 
-        // 用 raw http 打到第二个端口
-        const raw = await new Promise((resolve, reject) => {
-          const payload = JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'tools/call',
-            params: { name: 'cat', arguments: { path: outsideFile } },
-          });
-          const req = http.request(
-            {
-              host: '127.0.0.1',
-              port: port2,
-              path: '/mcp',
-              method: 'POST',
-              headers: {
-                'content-type': 'application/json',
-                accept: 'application/json, text/event-stream',
-                authorization: `Bearer ${TOKEN}`,
-                'content-length': Buffer.byteLength(payload),
+        // 用 raw http 打到第二个端口：读「项目所在盘根目录」下的哨兵
+        const callRaw = (filePath) =>
+          new Promise((resolve, reject) => {
+            const payload = JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'tools/call',
+              params: { name: 'cat', arguments: { path: filePath } },
+            });
+            const req = http.request(
+              {
+                host: '127.0.0.1',
+                port: port2,
+                path: '/mcp',
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  accept: 'application/json, text/event-stream',
+                  authorization: `Bearer ${TOKEN}`,
+                  'content-length': Buffer.byteLength(payload),
+                },
               },
-            },
-            (res) => {
-              let text = '';
-              res.setEncoding('utf8');
-              res.on('data', (c) => (text += c));
-              res.on('end', () => resolve(text));
-            },
-          );
-          req.on('error', reject);
-          req.end(payload);
-        });
+              (res) => {
+                let text = '';
+                res.setEncoding('utf8');
+                res.on('data', (c) => (text += c));
+                res.on('end', () => resolve(text));
+              },
+            );
+            req.on('error', reject);
+            req.end(payload);
+          });
+
+        const raw = await callRaw(volumeSentinel);
         const json = JSON.parse((/^data: (.*)$/m.exec(raw) || [null, raw])[1]);
         assert(!json.result?.isError, `不该报错：${JSON.stringify(json.result).slice(0, 300)}`);
-        assertMatch(json.result.content[0].text, /outside-marker-line/, '白名单外文件的内容');
+        assertMatch(json.result.content[0].text, /volume-marker-line/, '当前盘根目录下哨兵文件的内容');
+
+        // 反向确认：另一个盘（POSIX 上不存在这一档）仍被拒，证明「全盘」没有放大成「整机」
+        if (process.platform === 'win32') {
+          const otherDrive = `${projectVolumeRoot[0].toLowerCase() === 'c' ? 'D' : 'C'}:/`;
+          const otherFile = path.join(otherDrive, `fsmcp-other-volume-${Date.now()}.log`);
+          try {
+            await fsp.writeFile(otherFile, 'other-volume-line\n', 'utf8');
+            const raw2 = await callRaw(otherFile);
+            const json2 = JSON.parse((/^data: (.*)$/m.exec(raw2) || [null, raw2])[1]);
+            assert(json2.result?.isError === true, `另一个盘的路径应当被拒，实际：${raw2.slice(0, 200)}`);
+            assertMatch(json2.result.content[0].text, /E_OUTSIDE/, '越界错误');
+          } catch (err) {
+            if (err?.code !== 'EPERM' && err?.code !== 'EACCES') throw err;
+            console.log('      （另一个盘不可写，跳过反向确认）');
+          } finally {
+            await fsp.rm(otherFile, { force: true }).catch(() => {});
+          }
+        }
       } finally {
         child2.kill('SIGTERM');
         await new Promise((r) => setTimeout(r, 300));

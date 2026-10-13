@@ -14,11 +14,17 @@ import { DEFAULT_MAX_LINE_CHARS, readLinesRange, readTailLines, sniffBinary, sta
 const HARD_MAX_BYTES = 1024 * 1024;
 const PREFIX_SCAN_MAX = 8 * 1024 * 1024; // offset 之前超过这个量就不为行号做全前缀扫描了
 
-/** 数出 offset 之前有多少行，用来给分片续读定行号；前缀太大时返回近似 */
+/**
+ * 数出 offset 之前有多少行，用来给分片续读定行号；前缀太大时返回近似。
+ * @param {string} file
+ * @param {number} offset
+ * @returns {Promise<{ line: number | null, exact: boolean }>}
+ */
 async function linesBeforeOffset(file, offset) {
   if (offset <= 0) return { line: 1, exact: true };
   if (offset > PREFIX_SCAN_MAX) return { line: null, exact: false };
   const st = await statFile(file);
+  /** @type {import('node:fs/promises').FileHandle | undefined} */
   let fh;
   try {
     fh = await fsp.open(file, 'r');
@@ -38,35 +44,55 @@ async function linesBeforeOffset(file, offset) {
   }
 }
 
+/**
+ * @param {string} file
+ * @param {number} size
+ * @param {import('./base.js').ToolContext} ctx
+ * @returns {Promise<string[]>}
+ */
 async function readTailPreview(file, size, ctx) {
   const tail = await readTailLines(file, { size, maxLines: 10, maxBytes: 4096, maxLineChars: 200, signal: ctx.signal });
   return tail.entries.map((e) => `  ${e.text}`);
 }
 
-/** gzip 日志：解压后按行取尾部（先设文件大小上限，避免解压炸弹） */
+/**
+ * gzip 日志：解压后按行取尾部（先设文件大小上限，避免解压炸弹）。
+ * @param {string} file
+ * @param {{ lines?: number, maxLineChars?: number, signal?: AbortSignal }} [options]
+ * @returns {Promise<string[]>}
+ */
 export async function readGzipTail(file, { lines = 200, maxLineChars = DEFAULT_MAX_LINE_CHARS, signal } = {}) {
   const st = await statFile(file);
   if (st.size > 512 * 1024 * 1024) {
     throw new ToolError(`gzip 文件 ${formatBytes(st.size)} 太大，拒绝解压扫描`, { code: 'E_TOO_LARGE' });
   }
+  /** @type {string[]} */
   const ring = [];
-  const stream = fs.createReadStream(file).pipe(zlib.createGunzip());
+  const stdout = fs.createReadStream(file);
+  const stream = stdout.pipe(zlib.createGunzip());
   try {
     await streamLinesFromStream(stream, {
       maxLineChars,
       signal,
-      onLine: (text) => {
+      onLine: (/** @type {string} */ text) => {
         ring.push(text);
         while (ring.length > lines + 1) ring.shift();
       },
     });
   } finally {
+    // 只管 gunzip 流不会关掉上游文件流，两个都要 destroy，否则 fd 泄漏
     stream.destroy();
+    stdout.destroy();
   }
   return ring.slice(-lines);
 }
 
-/** 从任意可读流逐行（沿用同一套单行截断策略） */
+/**
+ * 从任意可读流逐行（沿用同一套单行截断策略）。
+ * @param {NodeJS.ReadableStream} stream
+ * @param {{ maxLineChars?: number, signal?: AbortSignal, onLine: (text: string) => void }} options
+ * @returns {Promise<void>}
+ */
 export async function streamLinesFromStream(stream, { maxLineChars = DEFAULT_MAX_LINE_CHARS, signal, onLine }) {
   const decoder = new StringDecoder('utf8');
   let pending = '';
@@ -74,7 +100,7 @@ export async function streamLinesFromStream(stream, { maxLineChars = DEFAULT_MAX
   for await (const chunk of stream) {
     counter += 1;
     if (counter % 32 === 0 && signal?.aborted) break;
-    pending += decoder.write(chunk);
+    pending += decoder.write(/** @type {Buffer} */ (chunk));
     let nl;
     while ((nl = pending.indexOf('\n')) !== -1) {
       const raw = pending.slice(0, nl).replace(/\r$/, '');

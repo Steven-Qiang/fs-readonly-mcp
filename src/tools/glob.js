@@ -6,7 +6,14 @@ import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, makeNameMatcher, toPosix } from '../util.js';
 import { walkFiles } from '../walk.js';
 
+/**
+ * 找最新修改的那个文件，供 hint 直接给出「看哪个」。
+ * @param {string[]} files
+ * @param {string} base
+ * @returns {Promise<{ full: string, rel: string, mtimeMs: number } | null>}
+ */
 async function newestOf(files, base) {
+  /** @type {{ full: string, rel: string, mtimeMs: number } | null} */
   let best = null;
   for (const f of files.slice(0, 500)) {
     try {
@@ -57,6 +64,7 @@ export const globTool = defineTool({
         })
       : { files: [allowed.real], stopReason: null, dirsVisited: [allowed.real] };
 
+    /** @param {string} f @returns {string} */
     const rel = (f) => (st.isDirectory() ? toPosix(path.relative(allowed.real, f)) : toPosix(allowed.abs));
     const hits = st.isDirectory() ? walk.files.filter((f) => matcher(path.basename(f)) || matcher(rel(f))) : [allowed.real];
 

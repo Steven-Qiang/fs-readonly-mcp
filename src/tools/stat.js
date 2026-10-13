@@ -7,6 +7,11 @@ import { countLines, readTailLines, sniffBinary } from '../primitives.js';
 
 const COUNT_LINES_MAX = 64 * 1024 * 1024; // 超过这个大小就不数行数了（数行要全文件扫描）
 
+/**
+ * 把「距上次修改过去了多久」写成人话，AI 用它判断日志还在不在写。
+ * @param {number} ms
+ * @returns {string}
+ */
 function ago(ms) {
   if (ms < 60_000) return `${Math.round(ms / 1000)} 秒前`;
   if (ms < 3_600_000) return `${Math.round(ms / 60000)} 分钟前`;

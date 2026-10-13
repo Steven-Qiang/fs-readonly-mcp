@@ -15,6 +15,13 @@ import { Roots } from './roots.js';
 import { createAudit } from './audit.js';
 import { assertReadOnlyToolset, createToolContext, registerTools, toolNames } from './tools/index.js';
 
+/**
+ * @typedef {import('express').Request} Req
+ * @typedef {import('express').Response} Res
+ * @typedef {import('express').NextFunction} Next
+ * @typedef {import('./tools/base.js').ToolContext} ToolContext
+ */
+
 const SERVER_NAME = 'fs-readonly-mcp';
 const SERVER_VERSION = '1.0.0';
 
@@ -23,10 +30,20 @@ assertReadOnlyToolset();
 const roots = new Roots(config.roots);
 const audit = createAudit(config);
 
+/**
+ * @param {...unknown} args
+ * @returns {void}
+ */
 function log(...args) {
   process.stdout.write(`[${new Date().toISOString()}] ${args.join(' ')}\n`);
 }
 
+/**
+ * 定长比较，避免用 === 比 token 时泄漏长度信息。
+ * @param {unknown} provided
+ * @param {unknown} expected
+ * @returns {boolean}
+ */
 function tokenMatches(provided, expected) {
   const a = Buffer.from(String(provided || ''));
   const b = Buffer.from(String(expected || ''));
@@ -34,12 +51,19 @@ function tokenMatches(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/** Bearer 鉴权：内网跳板机只做连接鉴权，不做任何密钥/隐私文件过滤 */
+/**
+ * Bearer 鉴权：内网跳板机只做连接鉴权，不做任何密钥/隐私文件过滤。
+ * 只认 Authorization 头 —— 不接受 query string 里的 token，那个会进 access log。
+ * @param {Req} req
+ * @param {Res} res
+ * @param {Next} next
+ * @returns {unknown}
+ */
 function requireToken(req, res, next) {
   if (!config.token) return next();
   const header = req.headers.authorization || '';
   const m = /^Bearer\s+(.+)$/i.exec(header);
-  const provided = m ? m[1].trim() : String(req.query.token || '');
+  const provided = m ? m[1].trim() : '';
   if (!provided) {
     res.set('www-authenticate', 'Bearer');
     return res.status(401).json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: '缺少凭据：请带 Authorization: Bearer <MCP_TOKEN>' } });
@@ -51,7 +75,11 @@ function requireToken(req, res, next) {
   return next();
 }
 
-/** 每次调用（每个请求）新建一个 McpServer：工具是纯只读的，天然无状态，不必维护会话内存 */
+/**
+ * 每次调用（每个请求）新建一个 McpServer：工具是纯只读的，天然无状态，不必维护会话内存。
+ * @param {ToolContext} ctx
+ * @returns {McpServer}
+ */
 function createServer(ctx) {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION, title: '只读文件系统（ls/grep/cat/tail）' },
@@ -66,12 +94,25 @@ function createServer(ctx) {
   return registerTools(server, ctx);
 }
 
-const handler = createMcpHandler((mcpCtx) => createServer(createToolContext({ config, roots, audit, logger: log, clientInfo: mcpCtx?.authInfo?.clientInfo || null })), {
-  legacy: 'stateless', // 2025 代客户端按无状态服务：每个请求独立，不占会话内存
-  onerror: (err) => log(`MCP handler 错误：${err?.stack || err}`),
-});
+const handler = createMcpHandler(
+  // 每次请求一个全新实例；会话号（规范头 mcp-session-id）带进工具上下文，仅用于审计关联
+  (mcpCtx) =>
+    createServer(
+      createToolContext({
+        config,
+        roots,
+        audit,
+        logger: log,
+        sessionId: mcpCtx?.requestInfo?.headers?.get('mcp-session-id') ?? null,
+      }),
+    ),
+  {
+    legacy: 'stateless', // 2025 代客户端按无状态服务：每个请求独立，不占会话内存
+    onerror: (/** @type {Error} */ err) => log(`MCP handler 错误：${err?.stack || err}`),
+  },
+);
 const nodeHandler = toNodeHandler(handler, {
-  onerror: (err) => log(`MCP 适配层错误：${err?.stack || err}`),
+  onerror: (/** @type {Error} */ err) => log(`MCP 适配层错误：${err?.stack || err}`),
   maxRequestBodySize: 1024 * 1024,
 });
 
@@ -80,7 +121,7 @@ const app = createMcpExpressApp({
   jsonLimit: '1mb',
 });
 
-app.get('/healthz', (_req, res) => {
+app.get('/healthz', (/** @type {Req} */ _req, /** @type {Res} */ res) => {
   res.json({
     ok: true,
     service: SERVER_NAME,
@@ -96,16 +137,15 @@ app.get('/healthz', (_req, res) => {
 // body 由 createMcpExpressApp 挂的 express.json() 解析（SDK 的约定用法），
 // 第三个参数把解析好的 body 交给 SDK —— toNodeHandler 的契约就是要这个。
 // 坏 JSON 由下面的 express 错误处理映射成 400 + -32700，符合 JSON-RPC 规范。
-app.all('/mcp', requireToken, (req, res) => {
+app.all('/mcp', requireToken, (/** @type {Req} */ req, /** @type {Res} */ res) => {
   void nodeHandler(req, res, req.body);
 });
 
-app.use((req, res) => {
+app.use((/** @type {Req} */ _req, /** @type {Res} */ res) => {
   res.status(404).json({ error: 'not_found', hint: 'MCP 端点是 /mcp ；健康检查是 GET /healthz' });
 });
 
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((/** @type {any} */ err, /** @type {Req} */ _req, /** @type {Res} */ res, /** @type {Next} */ _next) => {
   log(`express 错误：${err?.stack || err}`);
   // body 解析类错误按 400 回，其余才是 500
   const isBodyError = err?.type === 'entity.parse.failed' || err instanceof SyntaxError;
@@ -129,7 +169,16 @@ httpServer.keepAliveTimeout = 65_000;
 httpServer.headersTimeout = 70_000;
 httpServer.requestTimeout = 0; // 长耗时 grep/tail 不能被默认超时掐断
 
+/** 两个信号都注册了，加个闸门避免重复关闭 */
+let shuttingDown = false;
+
+/**
+ * @param {string} signal
+ * @returns {void}
+ */
 function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   log(`收到 ${signal}，关闭中…`);
   httpServer.close(() => {
     handler.close().finally(() => process.exit(0));
@@ -138,5 +187,5 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('unhandledRejection', (err) => log(`unhandledRejection: ${err?.stack || err}`));
-process.on('uncaughtException', (err) => log(`uncaughtException: ${err?.stack || err}`));
+process.on('unhandledRejection', (/** @type {unknown} */ err) => log(`unhandledRejection: ${/** @type {Error} */ (err)?.stack || err}`));
+process.on('uncaughtException', (/** @type {unknown} */ err) => log(`uncaughtException: ${/** @type {Error} */ (err)?.stack || err}`));

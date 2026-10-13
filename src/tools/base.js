@@ -2,28 +2,79 @@
 // 输出纪律：任何被截断的结果都必须带 [hint]，明确告诉 AI 下一步该用什么参数继续，而不是让它瞎猜。
 import { ToolError, truncateText } from '../util.js';
 
+/**
+ * @typedef {object} ToolContext
+ * @property {import('../config.js').Config} config
+ * @property {import('../roots.js').Roots} roots
+ * @property {import('../audit.js').Audit | null} [audit]
+ * @property {(msg: string) => void} [logger]
+ * @property {string | null} [sessionId] 会话号，仅用于审计关联
+ * @property {AbortSignal} [signal]
+ * @property {Deadline} [deadline]
+ */
+
+/**
+ * @typedef {object} Deadline
+ * @property {number} budgetMs
+ * @property {() => boolean} expired
+ * @property {() => number} elapsed
+ */
+
+/**
+ * @typedef {object} ToolRunResult
+ * @property {string} text 给 AI 的正文
+ * @property {number} elapsedMs 执行耗时
+ */
+
+/**
+ * @typedef {object} Tool
+ * @property {string} name
+ * @property {object} config 传给 McpServer.registerTool 的配置
+ * @property {(args: unknown, ctx: ToolContext) => Promise<ToolRunResult>} execute
+ */
+
+/** 工具统一输出容器：负责 [meta] 行、正文、以及超上限截断提示 */
 export class Out {
+  /**
+   * @param {Record<string, unknown>} [meta]
+   * @param {{ maxChars?: number }} [options]
+   */
   constructor(meta = {}, { maxChars = 64000 } = {}) {
     this.meta = { ...meta };
+    /** @type {string[]} */
     this.lines = [];
     this.maxChars = maxChars;
   }
 
+  /**
+   * @param {string} key
+   * @param {unknown} value 为空/空串时不写入
+   * @returns {this}
+   */
   set(key, value) {
     if (value !== undefined && value !== null && value !== '') this.meta[key] = value;
     return this;
   }
 
+  /**
+   * @param {unknown} text
+   * @returns {this}
+   */
   push(text) {
     if (text !== undefined && text !== null && text !== '') this.lines.push(String(text));
     return this;
   }
 
+  /**
+   * @param {unknown[]} items
+   * @returns {this}
+   */
   pushAll(items) {
     for (const it of items) this.push(it);
     return this;
   }
 
+  /** @returns {string} 形如 `[meta] tool=ls entries=3 ms=2` */
   metaLine() {
     const parts = Object.entries(this.meta)
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -31,6 +82,7 @@ export class Out {
     return parts.length ? `[meta] ${parts.join(' ')}` : '';
   }
 
+  /** @returns {string} 最终返回给 AI 的文本（含截断提示） */
   render() {
     const head = this.metaLine();
     const body = this.lines.join('\n');
@@ -41,6 +93,11 @@ export class Out {
   }
 }
 
+/**
+ * 单次调用的时间预算。
+ * @param {number} budgetMs
+ * @returns {Deadline}
+ */
 export function makeDeadline(budgetMs) {
   const started = Date.now();
   return {
@@ -50,10 +107,17 @@ export function makeDeadline(budgetMs) {
   };
 }
 
-/** 参数被 zod 拒绝时，给 AI 一份「能直接照抄」的修正提示 */
+/**
+ * 参数被 zod 拒绝时，给 AI 一份「能直接照抄」的修正提示。
+ * @param {unknown} error
+ * @returns {string}
+ */
 function describeIssues(error) {
-  const issues = error?.issues || [];
-  if (issues.length === 0) return String(error?.message || error);
+  const issues = /** @type {{ issues?: { path?: (string|number)[], message: string }[], message?: string }} */ (error)?.issues || [];
+  if (issues.length === 0) {
+    const fallback = /** @type {{ message?: string }} */ (error)?.message;
+    return String(fallback ?? error);
+  }
   return issues
     .map((i) => {
       const where = Array.isArray(i.path) && i.path.length ? i.path.join('.') : '(入参)';
@@ -65,6 +129,15 @@ function describeIssues(error) {
 /**
  * 定义一个只读工具。
  * 声明式写法的唯一出口：注册表、只读校验、参数校验、耗时统计、审计都在这里统一处理。
+ * @template {import('zod').ZodRawShape} S
+ * @param {object} spec
+ * @param {string} spec.name
+ * @param {string} spec.title
+ * @param {string} spec.description
+ * @param {import('zod').ZodObject<S>} spec.inputSchema
+ * @param {Record<string, unknown>} [spec.annotations]
+ * @param {(args: import('zod').output<import('zod').ZodObject<S>>, ctx: ToolContext) => Promise<Out | string>} spec.run
+ * @returns {Tool}
  */
 export function defineTool({ name, title, description, inputSchema, annotations = {}, run }) {
   return {
@@ -97,10 +170,15 @@ export function defineTool({ name, title, description, inputSchema, annotations 
   };
 }
 
-/** 工具报错统一转成 AI 能照着做的文本 */
+/**
+ * 工具报错统一转成 AI 能照着做的文本。
+ * @param {unknown} err
+ * @returns {string}
+ */
 export function errorText(err) {
   if (err instanceof ToolError) {
     return `[error] ${err.code}: ${err.message}${err.hint ? `\n[hint] ${err.hint}` : ''}`;
   }
-  return `[error] E_INTERNAL: ${err?.message || String(err)}`;
+  const message = /** @type {{ message?: string }} */ (err)?.message;
+  return `[error] E_INTERNAL: ${message || String(err)}`;
 }

@@ -6,6 +6,10 @@ import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, makeNameMatcher, toPosix } from '../util.js';
 import { listDir, walkFiles } from '../walk.js';
 
+/**
+ * @param {import('../walk.js').EntryType} type
+ * @returns {string}
+ */
 function typeMark(type) {
   if (type === 'dir') return 'd';
   if (type === 'file') return '-';

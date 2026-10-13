@@ -243,4 +243,4 @@ location /mcp {
 | 某个工具报 `E_PARAM` | 参数被 zod 拒绝，工具说明里每个参数都写了取值范围 |
 | 结果里出现 `[TRUNCATED]` | 超过 `MCP_MAX_TEXT_CHARS`。改用 `offset`/`limit` 分片或加 `grep` 过滤，**不要**加大上限重试 |
 | `grep` 说「已提前停止」 | 命中数 / 文件数 / 时间预算到顶。按 `[action]` 收窄目录、加 `glob`、把 pattern 写具体 |
-| 审计日志想查谁读了什么 | 配 `MCP_AUDIT_LOG`，每行一条 NDJSON：`ts / client / tool / args / ok / ms / chars`；全盘可读时强烈建议开 |
+| 审计日志想查谁读了什么 | 配 `MCP_AUDIT_LOG`，每行一条 NDJSON：`ts / session / tool / args / ok / ms / chars`；全盘可读时强烈建议开 |

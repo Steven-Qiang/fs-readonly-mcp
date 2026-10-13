@@ -8,6 +8,14 @@ import { readGzipTail } from './cat.js';
 
 const NUMBER_IF_SMALLER_THAN = 2 * 1024 * 1024; // 小于 2MB 才顺手把总行数算出来
 
+/**
+ * 处理一个文件：按行或按字节取尾部，写进 out。
+ * @param {import('../roots.js').Allowed} allowed
+ * @param {import('./base.js').ToolContext} ctx
+ * @param {Out} out
+ * @param {{ label: string, lines: number, bytes: number, maxLineChars: number, number: boolean, mode: 'lines'|'bytes' }} options
+ * @returns {Promise<void>}
+ */
 async function tailOne(allowed, ctx, out, { label, lines, bytes, maxLineChars, number, mode }) {
   const st = await statFile(allowed.real);
   if (st.isDirectory()) {

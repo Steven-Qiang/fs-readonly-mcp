@@ -47,11 +47,12 @@ export const grepTool = defineTool({
     } = args;
 
     const src = literal ? patternText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : patternText;
+    /** @type {RegExp} */
     let regex;
     try {
       regex = new RegExp(src, ignoreCase ? 'i' : '');
     } catch (err) {
-      throw new ToolError(`正则不合法：${patternText} → ${err.message}`, {
+      throw new ToolError(`正则不合法：${patternText} → ${/** @type {Error} */ (err).message}`, {
         code: 'E_REGEX',
         hint: '用 literal=true 按纯文本搜，或修正正则',
       });
@@ -68,7 +69,9 @@ export const grepTool = defineTool({
     const st = await fsp.stat(allowed.real);
     out.set('path', toPosix(allowed.abs));
 
+    /** @type {string[]} */
     let files = [];
+    /** @type {Awaited<ReturnType<typeof walkFiles>> | null} */
     let walkInfo = null;
     if (st.isDirectory()) {
       const walk = await walkFiles(allowed.real, {
@@ -92,10 +95,15 @@ export const grepTool = defineTool({
       files = [allowed.real];
     }
 
+    /** @type {{ file: string, line: number, text: string, context?: 'before'|'after', truncated?: boolean }[]} */
     const matches = [];
+    /** @type {{ file: string, message: string }[]} */
+    const readErrors = [];
     let filesWithMatch = 0;
     let filesScanned = 0;
     let bytesScanned = 0;
+    let truncatedLongLineInFile = false;
+    /** @type {string | null} */
     let stopped = null;
 
     await mapPool(files, 4, async (file) => {
@@ -125,9 +133,11 @@ export const grepTool = defineTool({
           maxLines: Infinity,
           maxBytes: Infinity,
           onLine: (entry) => {
+            // 命中数到顶：返回 false 让 streamLines 立刻收手，
+            // 否则会把这个文件剩下的几 GB 继续 regex 扫完再丢结果
             if (matches.length >= limit) {
               stopped = stopped || `命中数达到上限 limit=${limit}`;
-              return;
+              return false;
             }
             if (!entry.context) localHits += 1;
             matches.push({
@@ -137,13 +147,15 @@ export const grepTool = defineTool({
               context: entry.context,
               truncated: entry.truncated,
             });
+            return matches.length >= limit ? false : undefined;
           },
         });
         bytesScanned += stats.endByte;
+        if (stats.truncatedLongestLine) truncatedLongLineInFile = true;
         if (localHits > 0) filesWithMatch += 1;
       } catch (err) {
         if (err instanceof ToolError && err.code === 'E_NOT_FOUND') return null;
-        matches.push({ file: display, line: 0, text: `[读取失败] ${err.message}`, error: true });
+        readErrors.push({ file: display, message: /** @type {Error} */ (err).message });
       }
       return null;
     });
@@ -183,6 +195,16 @@ export const grepTool = defineTool({
     }
     if (walkInfo?.stopReason) {
       out.push(`[hint] 目录遍历也被截断：${walkInfo.stopReason}；提高 maxFiles/maxDepth 可覆盖更多文件。`);
+    }
+    if (truncatedLongLineInFile) {
+      out.push('[hint] 有文件含超长行（>1MB），这类行只搜了开头 1MB；如果关键字在超长行靠后位置，可能漏报。');
+    }
+    if (readErrors.length > 0) {
+      out.push('');
+      out.push(`[hint] 另有 ${readErrors.length} 个文件读取失败（未计入上面的命中数）：`);
+      for (const e of readErrors.slice(0, 5)) out.push(`  · ${e.file} → ${e.message}`);
+      if (readErrors.length > 5) out.push(`  · …还有 ${readErrors.length - 5} 个`);
+      out.push('[action] 失败多为权限不足或文件被删除；需要看单个文件时直接对它调 cat/tail。');
     }
     return out;
   },
