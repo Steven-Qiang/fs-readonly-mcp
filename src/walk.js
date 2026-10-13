@@ -197,6 +197,35 @@ export async function walkFiles(rootDir, opts) {
 }
 
 /**
+ * 全局「重活」闸门：同一时刻最多 N 个重扫描（grep / glob 递归）。
+ * 为什么必须有：AI 客户端在工具超时后会重试，没有全局闸门时几次重试就能把
+ * 多路并发叠在一起，把同机部署的服务器的 IO 打满。
+ * @param {number} [slots]
+ * @returns {<T>(fn: () => Promise<T>) => Promise<T>}
+ */
+export function createHeavyGate(slots = 2) {
+  let running = 0;
+  /** @type {(() => void)[]} */
+  const waiters = [];
+  const release = () => {
+    const w = waiters.shift();
+    if (w) w();
+  };
+  return async function withSlot(fn) {
+    if (running >= slots) {
+      await new Promise((resolve) => waiters.push(() => resolve(undefined)));
+    }
+    running += 1;
+    try {
+      return await fn();
+    } finally {
+      running -= 1;
+      release();
+    }
+  };
+}
+
+/**
  * 并发映射，保持结果顺序；一项失败不影响其它项。
  * @template T, R
  * @param {T[]} items

@@ -78,7 +78,30 @@ async function makeFixtures(root) {
   }
   await handle.write(buf);
   await handle.close();
-  return { projA, projB, logsA, big, appLines };
+
+  // 复现线上事故的目录：多个大日志文件 + 极稀疏的关键字。
+  // 目的：验证 grep 有「扫描量预算」，不会为凑够 limit 条命中把整年日志读完。
+  const sparseDir = path.join(projA, 'yearlogs');
+  await fsp.mkdir(sparseDir, { recursive: true });
+  for (let f = 0; f < 6; f += 1) {
+    const h = await fsp.open(path.join(sparseDir, `2026-0${f + 1}-service.log`), 'w');
+    let chunk = '';
+    for (let i = 0; i < 60_000; i += 1) {
+      // 每 6 万行才有一条命中 → 命中极度稀疏
+      chunk +=
+        i === 30_000
+          ? `2026-0${f + 1}-01 00:00:00 ERROR PHP Fatal error: Call to undefined method Foo::bar()\n`
+          : `2026-0${f + 1}-01 00:00:00 INFO  handled request id=${i} ms=${i % 997}\n`;
+      if (chunk.length > 512 * 1024) {
+        await h.write(chunk);
+        chunk = '';
+      }
+    }
+    await h.write(chunk);
+    await h.close();
+  }
+
+  return { projA, projB, logsA, big, appLines, sparseDir };
 }
 
 // ---------- HTTP 小客户端 ----------
@@ -426,6 +449,39 @@ async function main() {
       const { text } = await callTool('grep', { pattern: 'ZZZ_NOT_THERE', path: '', project: 'projA' });
       assertMatch(text, /没有命中/, '无命中');
       assertMatch(text, /\[hint\]/, '建议');
+    });
+
+    await check('grep 扫描量预算：超预算立即停并说明已读多少（线上卡死复现）', async () => {
+      // 用 4MB 预算打 100MB+ 的稀疏日志目录：必须触发上限并停下，而不是把整年日志读完
+      const t0 = Date.now();
+      const { text } = await callTool('grep', {
+        pattern: 'Call to undefined method',
+        path: 'yearlogs',
+        project: 'projA',
+        glob: '2026*.log',
+        limit: 40,
+        maxLineChars: 300,
+        maxScanBytes: 4 * 1024 * 1024,
+      });
+      const ms = Date.now() - t0;
+      assertMatch(text, /已提前停止：.*maxScanBytes/, '必须因扫描量上限停止');
+      assertMatch(text, /本次只读了 [\d.]+[KMG]?B 就停了/, '必须说明已读多少');
+      assertMatch(text, /path=|子目录|glob/, '必须给出收窄建议');
+      assert(ms < 15000, `触发上限后应当很快返回，实际 ${ms}ms`);
+      const scanned = /已扫描 (\d+) 个文件/.exec(text);
+      assert(scanned && Number(scanned[1]) < 6, `不该把所有文件都读完：已扫描 ${scanned?.[1]} 个`);
+    });
+
+    await check('grep 低于预算时正常搜完并命中', async () => {
+      const { text } = await callTool('grep', {
+        pattern: 'Call to undefined method',
+        path: 'yearlogs',
+        project: 'projA',
+        glob: '2026*.log',
+        limit: 40,
+      });
+      assertMatch(text, /命中 [1-9]/, '应当命中（6 个文件都在默认 256MB 预算内）');
+      assert(!/maxScanBytes/.test(text), '没超预算就不该报扫描上限');
     });
 
     await check('glob_files 按通配找文件并推荐最新那个', async () => {

@@ -317,7 +317,7 @@ export async function streamLines(file, opts = {}) {
       if (discarded > 0) raw = raw.slice(0, longestLine);
       finalizeLine(raw, byteStart, lineEnd, discarded);
       if (hardStop()) return true;
-      if (deadline && lineNo % 512 === 0 && deadline.expired()) {
+      if (deadline && lineNo % 256 === 0 && deadline.expired()) {
         stopWith('达到单次调用时间预算 ' + deadline.budgetMs + 'ms');
         return true;
       }
@@ -328,7 +328,8 @@ export async function streamLines(file, opts = {}) {
   try {
     for await (const chunk of stream) {
       checkCounter += 1;
-      if (checkCounter % 8 === 0) {
+      // 每 4 个 chunk（约 1MB）就看一次是否该收手：大文件上预算过期/客户端断开要尽快生效
+      if (checkCounter % 4 === 0) {
         if (signal?.aborted) {
           stopWith('客户端已断开，停止扫描');
           break;

@@ -4,7 +4,10 @@ import fsp from 'node:fs/promises';
 import { z } from 'zod';
 import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, makeNameMatcher, toPosix } from '../util.js';
-import { walkFiles } from '../walk.js';
+import { createHeavyGate, walkFiles } from '../walk.js';
+
+/** 全局重活闸门：同一时刻最多 2 个递归扫描（与 grep 共用同一档位语义） */
+const heavyGate = createHeavyGate(2);
 
 /**
  * 找最新修改的那个文件，供 hint 直接给出「看哪个」。
@@ -53,15 +56,19 @@ export const globTool = defineTool({
     const st = await fsp.stat(allowed.real);
     out.set('path', toPosix(allowed.abs));
 
+    // 递归遍历是重活：走全局闸门，避免多个调用叠加把服务器 IO 打满
+    // maxFiles 要比「返回上限」高一个量级，否则先扫到的非匹配文件会把配额吃光
     const walk = st.isDirectory()
-      ? await walkFiles(allowed.real, {
-          maxDepth,
-          maxFiles: limit,
-          signal: ctx.signal,
-          deadline: ctx.deadline,
-          ignoreDirs: ctx.config.ignoreDirs,
-          includeHidden,
-        })
+      ? await heavyGate(() =>
+          walkFiles(allowed.real, {
+            maxDepth,
+            maxFiles: Math.max(limit * 10, 500),
+            signal: ctx.signal,
+            deadline: ctx.deadline,
+            ignoreDirs: ctx.config.ignoreDirs,
+            includeHidden,
+          }),
+        )
       : { files: [allowed.real], stopReason: null, dirsVisited: [allowed.real] };
 
     /** @param {string} f @returns {string} */
