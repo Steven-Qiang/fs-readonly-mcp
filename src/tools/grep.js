@@ -2,53 +2,49 @@
 // 实现要点：每个文件独立流式扫描、并发上限、命中数与文件数双封顶、到点即停并明确告诉 AI 怎么收窄。
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { Out, bool, num, str } from './base.js';
+import { z } from 'zod';
+import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, makeNameMatcher, toPosix } from '../util.js';
 import { DEFAULT_MAX_LINE_CHARS, streamLines } from '../primitives.js';
 import { mapPool, walkFiles } from '../walk.js';
 
 const DEFAULT_GLOBS = ['*.log', '*.log.*', '*.txt', '*.out', '*.err', '*.json', '*.ndjson', '*.trace', '*.csv'];
 
-export const grepTool = {
+export const grepTool = defineTool({
   name: 'grep',
   title: '搜索文件内容',
   description:
     '在文件或整个目录里搜索文本/正则（只读），逐行流式扫描，超大日志也能搜。' +
-    '默认忽略 node_modules/.git/vendor，默认大小写不敏感，可带上下文行。返回 file:line: 内容。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      pattern: { type: 'string', description: '要搜索的关键字或正则（默认大小写不敏感）' },
-      path: { type: 'string', description: '文件或目录路径；目录会递归搜索。默认项目根。' },
-      project: { type: 'string', description: '项目别名，来自 list_roots' },
-      glob: { type: 'string', description: '只搜匹配这些名字的文件（逗号分隔），如 "*.log,*.err"；默认常见日志/文本类' },
-      ignoreCase: { type: 'boolean', description: '是否忽略大小写，默认 true' },
-      literal: { type: 'boolean', description: '按纯文本搜索、不当正则解释（含 . * ( ) 等字符时用），默认 false' },
-      beforeContext: { type: 'integer', description: '每个命中行前面额外带几行上下文，默认 0，最大 10' },
-      afterContext: { type: 'integer', description: '每个命中行后面额外带几行上下文，默认 0，最大 10' },
-      maxDepth: { type: 'integer', description: '目录递归深度，默认 4，最大 8' },
-      limit: { type: 'integer', description: '最多返回多少条命中行，默认 100，最大 1000' },
-      maxFiles: { type: 'integer', description: '最多扫描多少个文件，默认 300，最大 3000' },
-      includeHidden: { type: 'boolean', description: '是否搜索隐藏文件/目录，默认 false' },
-    },
-    required: ['pattern'],
-    additionalProperties: false,
-  },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    '默认忽略 node_modules/.git/vendor，默认大小写不敏感，可带上下文行。返回 file 分组 + 行号 + 内容。',
+  inputSchema: z.object({
+    pattern: z.string().min(1).describe('要搜索的关键字或正则（默认大小写不敏感）'),
+    path: z.string().optional().describe('文件或目录路径；目录会递归搜索。默认项目根。'),
+    project: z.string().optional().describe('项目别名，来自 list_roots'),
+    glob: z.string().optional().describe('只搜匹配这些名字的文件（逗号分隔），如 "*.log,*.err"；默认常见日志/文本类'),
+    ignoreCase: z.boolean().optional().describe('是否忽略大小写，默认 true'),
+    literal: z.boolean().optional().describe('按纯文本搜索、不当正则解释（含 . * ( ) 等字符时用），默认 false'),
+    beforeContext: z.number().int().min(0).max(10).optional().describe('每个命中行前面额外带几行上下文，默认 0'),
+    afterContext: z.number().int().min(0).max(10).optional().describe('每个命中行后面额外带几行上下文，默认 0'),
+    maxDepth: z.number().int().min(1).max(8).optional().describe('目录递归深度，默认 4，最大 8'),
+    limit: z.number().int().min(1).max(1000).optional().describe('最多返回多少条命中行，默认 100，最大 1000'),
+    maxFiles: z.number().int().min(1).max(3000).optional().describe('最多扫描多少个文件，默认 300，最大 3000'),
+    includeHidden: z.boolean().optional().describe('是否搜索隐藏文件/目录，默认 false'),
+  }),
   async run(args, ctx) {
-    const patternText = str(args, 'pattern');
-    if (!patternText) throw new ToolError('必须传 pattern', { code: 'E_PARAM' });
-    const project = str(args, 'project');
-    const relPath = str(args, 'path', '');
-    const globArg = str(args, 'glob');
-    const ignoreCase = bool(args, 'ignoreCase', true);
-    const literal = bool(args, 'literal', false);
-    const beforeContext = num(args, 'beforeContext', 0, { min: 0, max: 10 });
-    const afterContext = num(args, 'afterContext', 0, { min: 0, max: 10 });
-    const maxDepth = num(args, 'maxDepth', 4, { min: 1, max: 8 });
-    const limit = num(args, 'limit', 100, { min: 1, max: 1000 });
-    const maxFiles = num(args, 'maxFiles', 300, { min: 1, max: 3000 });
-    const includeHidden = bool(args, 'includeHidden', false);
+    const {
+      pattern: patternText,
+      project,
+      path: relPath = '',
+      glob: globArg,
+      ignoreCase = true,
+      literal = false,
+      beforeContext = 0,
+      afterContext = 0,
+      maxDepth = 4,
+      limit = 100,
+      maxFiles = 300,
+      includeHidden = false,
+    } = args;
 
     const src = literal ? patternText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : patternText;
     let regex;
@@ -60,14 +56,13 @@ export const grepTool = {
         hint: '用 literal=true 按纯文本搜，或修正正则',
       });
     }
-
     const nameMatcher = makeNameMatcher(globArg ? globArg.split(',') : DEFAULT_GLOBS);
 
     const out = new Out({ tool: 'grep', pattern: patternText }, { maxChars: ctx.config.maxTextChars });
     if (literal) out.set('literal', true);
     if (!ignoreCase) out.set('ignoreCase', false);
 
-    const target = await ctx.roots.resolveTarget(project, relPath === undefined ? '' : relPath);
+    const target = await ctx.roots.resolveTarget(project, relPath);
     const allowed = await ctx.roots.checkAllowed(target.path);
     if (!allowed.exists) throw new ToolError(`路径不存在：${toPosix(allowed.abs)}`, { code: 'E_NOT_FOUND' });
     const st = await fsp.stat(allowed.real);
@@ -173,8 +168,7 @@ export const grepTool = {
         out.push(`${m.file}`);
         lastFile = m.file;
       }
-      const mark = m.context ? '-' : ':';
-      out.push(`  ${m.line}${mark} ${m.text}`);
+      out.push(`  ${m.line}${m.context ? '-' : ':'} ${m.text}`);
     }
 
     out.push('');
@@ -192,4 +186,4 @@ export const grepTool = {
     }
     return out;
   },
-};
+});

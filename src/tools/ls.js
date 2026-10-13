@@ -1,7 +1,8 @@
 // ls：列目录。默认只列一层（最快）；depth>1 走有界 BFS，条目数封顶，超了给明确提示。
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { Out, bool, num, str } from './base.js';
+import { z } from 'zod';
+import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, makeNameMatcher, toPosix } from '../util.js';
 import { listDir, walkFiles } from '../walk.js';
 
@@ -12,36 +13,33 @@ function typeMark(type) {
   return '?';
 }
 
-export const lsTool = {
+export const lsTool = defineTool({
   name: 'ls',
   title: '列目录',
   description:
     '列目录内容（只读）。不传 path 时列出所有可读根目录；传 project 则从该项目的根/日志目录出发。' +
-    '默认只列一层，快；需要看结构用 depth=2~4。输出格式：类型 d/- + 大小 + 修改时间 + 名字。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '目录路径，绝对路径或相对 project 的路径。空 = 列根目录。' },
-      project: { type: 'string', description: '项目别名，来自 list_roots' },
-      depth: { type: 'integer', description: '递归层数，默认 1（只列当前层），最大 6' },
-      pattern: { type: 'string', description: '名字通配，如 "*.log" / "*error*" / "{a,b}.log"' },
-      filesOnly: { type: 'boolean', description: '只列文件，不列目录' },
-      includeHidden: { type: 'boolean', description: '是否包含点开头的隐藏项，默认 true' },
-      includeIgnored: { type: 'boolean', description: '是否包含 node_modules/.git/vendor 等默认忽略目录，默认 false' },
-      maxEntries: { type: 'integer', description: '最多返回多少条，默认 300，最大 2000' },
-    },
-    additionalProperties: false,
-  },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    '默认只列一层，快；需要看结构用 depth=2~4。输出：类型 d/- + 大小 + 修改时间 + 名字。',
+  inputSchema: z.object({
+    path: z.string().optional().describe('目录路径，绝对路径或相对 project 的路径。空 = 列根目录。'),
+    project: z.string().optional().describe('项目别名，来自 list_roots'),
+    depth: z.number().int().min(1).max(6).optional().describe('递归层数，默认 1（只列当前层），最大 6'),
+    pattern: z.string().optional().describe('名字通配，如 "*.log" / "*error*" / "{a,b}.log"'),
+    filesOnly: z.boolean().optional().describe('只列文件，不列目录，默认 false'),
+    includeHidden: z.boolean().optional().describe('是否包含点开头的隐藏项，默认 true'),
+    includeIgnored: z.boolean().optional().describe('是否包含 node_modules/.git/vendor 等默认忽略目录，默认 false'),
+    maxEntries: z.number().int().min(1).max(2000).optional().describe('最多返回多少条，默认 300，最大 2000'),
+  }),
   async run(args, ctx) {
-    const project = str(args, 'project');
-    const relPath = str(args, 'path', '');
-    const depth = num(args, 'depth', 1, { min: 1, max: 6 });
-    const maxEntries = num(args, 'maxEntries', 300, { min: 1, max: 2000 });
-    const filesOnly = bool(args, 'filesOnly', false);
-    const includeHidden = bool(args, 'includeHidden', true);
-    const includeIgnored = bool(args, 'includeIgnored', false);
-    const pattern = str(args, 'pattern');
+    const {
+      project,
+      path: relPath = '',
+      depth = 1,
+      maxEntries = 300,
+      filesOnly = false,
+      includeHidden = true,
+      includeIgnored = false,
+      pattern,
+    } = args;
     const matcher = pattern ? makeNameMatcher(pattern) : null;
     const ignoreDirs = includeIgnored ? new Set() : ctx.config.ignoreDirs;
 
@@ -49,7 +47,7 @@ export const lsTool = {
     out.set('project', project);
 
     // 不指定 path/project → 相当于把根目录清单再说一遍
-    if (!project && (relPath === '' || relPath === '.' || relPath === undefined)) {
+    if (!project && relPath === '') {
       out.push('[meta] tool=ls 未指定 path/project，列出全部根目录');
       out.push('');
       for (const r of ctx.roots.describe()) {
@@ -62,21 +60,17 @@ export const lsTool = {
 
     const target = await ctx.roots.resolveTarget(project, relPath);
     const allowed = await ctx.roots.checkAllowed(target.path);
-    if (!allowed.exists) {
-      throw new ToolError(`路径不存在：${toPosix(allowed.abs)}`, { code: 'E_NOT_FOUND' });
-    }
+    if (!allowed.exists) throw new ToolError(`路径不存在：${toPosix(allowed.abs)}`, { code: 'E_NOT_FOUND' });
     const st = await fsp.stat(allowed.real);
+
     if (!st.isDirectory()) {
-      out.push(`[meta] tool=ls path=${toPosix(allowed.abs)} 是文件不是目录`);
+      out.set('path', toPosix(allowed.abs));
+      out.push('[meta] 这是文件，不是目录');
+      out.push('');
+      out.push(`${typeMark('file')} ${formatBytes(st.size)}  ${formatTime(st.mtime)}  ${toPosix(path.basename(allowed.abs))}`);
       out.push('');
       out.push(
-        `${typeMark('file')} ${formatBytes(st.size)}  ${formatTime(st.mtime)}  ${toPosix(path.basename(allowed.abs))}`,
-      );
-      out.push('');
-      out.push(
-        `[hint] 这是个文件。看内容用 cat path="${toPosix(allowed.abs)}"，看尾部用 tail path="${toPosix(
-          allowed.abs,
-        )}"，元信息用 stat。`,
+        `[hint] 看内容用 cat path="${toPosix(allowed.abs)}"，看尾部用 tail path="${toPosix(allowed.abs)}"，元信息用 stat。`,
       );
       return out;
     }
@@ -87,11 +81,7 @@ export const lsTool = {
     out.set('pattern', pattern);
 
     if (depth === 1) {
-      const { entries, moreByType, scanned } = await listDir(base, {
-        limit: maxEntries,
-        ignoreDirs,
-        signal: ctx.signal,
-      });
+      const { entries, moreByType, scanned } = await listDir(base, { limit: maxEntries, ignoreDirs, signal: ctx.signal });
       const shownEntries = includeHidden ? entries : entries.filter((e) => !e.name.startsWith('.'));
       const filtered = matcher ? shownEntries.filter((e) => matcher(e.name)) : shownEntries;
       const visible = filesOnly ? filtered.filter((e) => e.type !== 'dir') : filtered;
@@ -140,10 +130,7 @@ export const lsTool = {
           .map((d) => toPosix(path.relative(base, d)))
           .filter((d) => !matcher || matcher(path.basename(d)));
 
-    const dirBudget = Math.min(
-      dirs.length,
-      files.length >= maxEntries ? 0 : Math.max(5, Math.floor(maxEntries * 0.2)),
-    );
+    const dirBudget = Math.min(dirs.length, files.length >= maxEntries ? 0 : Math.max(5, Math.floor(maxEntries * 0.2)));
     out.set('dirs', dirs.length);
     out.set('files', files.length);
     out.push('');
@@ -175,9 +162,7 @@ export const lsTool = {
       out.push(`[hint] 还有 ${files.length - fileBudget} 个文件未列出（上限 maxEntries=${maxEntries}）。`);
       out.push('[action] 提高 maxEntries、加 pattern 过滤，或缩小 depth。');
     }
-    if (files.length === 0 && dirs.length === 0) {
-      out.push('(没有匹配项)');
-    }
+    if (files.length === 0 && dirs.length === 0) out.push('(没有匹配项)');
     return out;
   },
-};
+});

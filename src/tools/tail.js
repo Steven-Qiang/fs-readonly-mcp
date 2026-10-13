@@ -1,6 +1,7 @@
 // tail：看文件末尾。只读文件尾部窗口，成本与文件总大小无关（看大日志首选）。
 import fsp from 'node:fs/promises';
-import { Out, bool, num, str } from './base.js';
+import { z } from 'zod';
+import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, toPosix } from '../util.js';
 import { DEFAULT_MAX_LINE_CHARS, countLines, readTailBytes, readTailLines, statFile } from '../primitives.js';
 import { readGzipTail } from './cat.js';
@@ -77,37 +78,31 @@ async function tailOne(allowed, ctx, out, { label, lines, bytes, maxLineChars, n
   }
 }
 
-export const tailTool = {
+export const tailTool = defineTool({
   name: 'tail',
   title: '看文件末尾',
   description:
     '读取文件末尾若干行（只读），与文件总大小无关，是看大日志最快的方式。' +
     '支持多文件一次对比；.gz 日志自动解压后取尾部；mode=bytes 可直接看末 N 字节。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径；多个文件用英文逗号分隔' },
-      project: { type: 'string', description: '项目别名，来自 list_roots' },
-      lines: { type: 'integer', description: '看末尾多少行，默认 100，最大 5000' },
-      bytes: { type: 'integer', description: '配合 mode=bytes：看末尾多少字节，默认 4096，最大 1048576' },
-      mode: { type: 'string', enum: ['lines', 'bytes'], description: 'lines（默认，按行）或 bytes（按原始字节）' },
-      number: { type: 'boolean', description: '是否带行号（文件小于 2MB 时精确），默认 false' },
-      maxLineChars: { type: 'integer', description: '单行最多输出多少字符，默认 4096' },
-    },
-    required: ['path'],
-    additionalProperties: false,
-  },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: z.object({
+    path: z.string().min(1).describe('文件路径；多个文件用英文逗号分隔'),
+    project: z.string().optional().describe('项目别名，来自 list_roots'),
+    lines: z.number().int().min(1).max(5000).optional().describe('看末尾多少行，默认 100，最大 5000'),
+    bytes: z.number().int().min(1).max(1024 * 1024).optional().describe('配合 mode=bytes：看末尾多少字节，默认 4096'),
+    mode: z.enum(['lines', 'bytes']).optional().describe('lines（默认，按行）或 bytes（按原始字节）'),
+    number: z.boolean().optional().describe('是否带行号（文件小于 2MB 时精确），默认 false'),
+    maxLineChars: z.number().int().min(80).max(100000).optional().describe('单行最多输出多少字符，默认 4096'),
+  }),
   async run(args, ctx) {
-    const project = str(args, 'project');
-    const rawPath = str(args, 'path');
-    if (!rawPath) throw new ToolError('必须传 path', { code: 'E_PARAM' });
-    const lines = num(args, 'lines', 100, { min: 1, max: 5000 });
-    const bytes = num(args, 'bytes', 4096, { min: 1, max: 1024 * 1024 });
-    const mode = str(args, 'mode', 'lines') === 'bytes' ? 'bytes' : 'lines';
-    const number = bool(args, 'number', false);
-    const maxLineChars = num(args, 'maxLineChars', DEFAULT_MAX_LINE_CHARS, { min: 80, max: 100000 });
-
+    const {
+      path: rawPath,
+      project,
+      lines = 100,
+      bytes = 4096,
+      mode = 'lines',
+      number = false,
+      maxLineChars = DEFAULT_MAX_LINE_CHARS,
+    } = args;
     const out = new Out({ tool: 'tail', mode }, { maxChars: ctx.config.maxTextChars });
     const paths = rawPath
       .split(',')
@@ -131,4 +126,4 @@ export const tailTool = {
     }
     return out;
   },
-};
+});

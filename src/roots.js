@@ -50,7 +50,8 @@ export class Roots {
       name: r.name,
       dirs: r.dirsResolved.map(toPosix),
       description: r.description,
-      exists: r.dirsResolved.some((c) => fs.existsSync(c)),
+      // 「全盘」根不需要探测存在性
+      exists: r.allRoots ? true : r.dirsResolved.some((c) => fs.existsSync(c)),
     }));
   }
 
@@ -88,10 +89,15 @@ export class Roots {
       });
     }
 
-    if (path.isAbsolute(toPosix(rel))) {
+    if (path.isAbsolute(toPosix(rel)) || /^[A-Za-z]:[\\/]/.test(rel)) {
       const abs = path.resolve(toPosix(rel));
       if (await exists(abs)) return { path: abs, root: null, tried: [toPosix(abs)], dirs: [] };
-      if (this.matchRoot(abs)) return { path: abs, root: null, tried: [toPosix(abs)], dirs: [] };
+      // 不存在也放行两种情况，好让 checkAllowed 给出准确报错：
+      //   · 路径落在某个根目录内（例如根目录里的文件写错了名）
+      //   · 有「全盘」根（MCP_ROOTS 没配或写了 /）—— 整机可读，任意盘符都算数
+      if (this.matchRoot(abs) || this.roots.some((r) => r.allRoots)) {
+        return { path: abs, root: null, tried: [toPosix(abs)], dirs: [] };
+      }
       throw new ToolError(`路径不存在：${toPosix(abs)}`, { code: 'E_NOT_FOUND' });
     }
 
@@ -113,7 +119,10 @@ export class Roots {
     });
   }
 
-  /** 找到包含该路径的根（取最具体的一个）。absPath 必须是 realpath 之后的结果 */
+  /**
+   * 找到包含该路径的根（取最具体的一个）。absPath 必须是 realpath 之后的结果。
+   * 配了「全盘」根（MCP_ROOTS 没配 / 写了 /）时，其它盘符的路径也归它管。
+   */
   matchRoot(absPath) {
     let best = null;
     for (const root of this.roots) {
@@ -123,7 +132,11 @@ export class Roots {
         }
       }
     }
-    return best;
+    if (best) return best;
+    const all = this.roots.find((r) => r.allRoots);
+    if (!all) return null;
+    const parsed = path.parse(path.resolve(absPath));
+    return { root: all, dir: parsed.root };
   }
 
   /** 校验（必要时 realpath）并返回安全可读的绝对路径 */

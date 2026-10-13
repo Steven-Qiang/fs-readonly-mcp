@@ -47,15 +47,6 @@ function matchAt(re, text) {
   return re.exec(text);
 }
 
-export function makeDeadline(budgetMs) {
-  const started = Date.now();
-  return {
-    budgetMs,
-    expired: () => Date.now() - started > budgetMs,
-    elapsed: () => Date.now() - started,
-  };
-}
-
 function countNewlines(buf, from = 0, to = buf.length) {
   let n = 0;
   let last = -1;

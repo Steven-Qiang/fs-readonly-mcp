@@ -32,13 +32,20 @@ async function rpc(method, params, session) {
   const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${TOKEN}` };
   if (session) headers['mcp-session-id'] = session;
   const res = await request('POST', '/mcp', { headers, body: JSON.stringify({ jsonrpc: '2.0', id: id++, method, params }) });
-  const payload = JSON.parse(res.text);
+  let payload;
+  if ((res.headers['content-type'] || '').includes('text/event-stream')) {
+    const m = /^data: (.*)$/m.exec(res.text);
+    payload = m ? JSON.parse(m[1]) : null;
+  } else {
+    payload = JSON.parse(res.text);
+  }
   if (payload.error) throw new Error(payload.error.message);
   return { result: payload.result, headers: res.headers };
 }
 
 async function callTool(session, name, args) {
   const { result } = await rpc('tools/call', { name, arguments: args }, session);
+  if (result?.isError) throw new Error(`工具 ${name} 报错：${result.content?.[0]?.text?.slice(0, 200)}`);
   return result.content[0].text;
 }
 
@@ -103,21 +110,19 @@ async function main() {
     void session;
 
     const t = async (label, fn, expect) => {
-      const rss0 = child.exitCode === null ? process.memoryUsage().rss : 0;
       const t0 = Date.now();
       const text = await fn();
       const ms = Date.now() - t0;
       const ok = expect ? expect(text) : true;
       console.log(`${ok ? '✓' : '✗'} ${label.padEnd(46)} ${String(ms).padStart(7)}ms   输出 ${(text.length / 1024).toFixed(1)}KB`);
       if (!ok) console.log(`   ✗ 断言不通过：${text.slice(0, 300)}`);
-      void rss0;
       return ms;
     };
 
     console.log(`\n文件总量 ${(bytes / 1024 / 1024).toFixed(0)}MB / ${lines} 行\n`);
 
     await t('tail 200 行（应远小于 1s，与文件大小无关）', () => callTool(session, 'tail', { path: file, lines: 200 }), (x) =>
-      x.includes(`id=${lines - 1}`) || x.includes('msg=handled request'),
+      x.includes(`id=${lines - 1}`),
     );
     await t('tail 5000 行', () => callTool(session, 'tail', { path: file, lines: 5000 }));
     await t('tail mode=bytes 64KB', () => callTool(session, 'tail', { path: file, mode: 'bytes', bytes: 65536 }));

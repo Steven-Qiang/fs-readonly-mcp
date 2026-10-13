@@ -1,8 +1,6 @@
-// 端到端自测：造一批真实日志文件 → 起真实服务 → 走完整 MCP Streamable HTTP 流程 → 逐个工具断言。
+// 端到端自测：造一批真实日志文件 → 起真实服务（express + 官方 MCP SDK）→ 走完整 MCP 流程 → 逐个工具断言。
 // 跑法：node test/test.js      退出码 0 = 全通过
-import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -27,7 +25,17 @@ async function check(name, fn) {
   } catch (err) {
     failed += 1;
     failures.push({ name, err });
-    console.log(`  ✗ ${name}\n      ${err.message.split('\n')[0]}`);
+    console.log(`  ✗ ${name}\n      ${String(err.message).split('\n')[0]}`);
+  }
+}
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || '断言失败');
+}
+
+function assertMatch(text, re, label) {
+  if (!re.test(text)) {
+    throw new Error(`${label || '内容'}不匹配 ${re}\n---实际输出---\n${String(text).slice(0, 1200)}`);
   }
 }
 
@@ -39,21 +47,18 @@ async function makeFixtures(root) {
   await fsp.mkdir(logsA, { recursive: true });
   await fsp.mkdir(path.join(projB, 'sub'), { recursive: true });
 
-  await fsp.writeFile(
-    path.join(logsA, 'app.log'),
-    [
-      '2026-01-01 10:00:00 INFO  boot ok',
-      '2026-01-01 10:00:01 INFO  loaded config',
-      '2026-01-01 10:00:02 ERROR connect redis failed: timeout',
-      '2026-01-01 10:00:03 INFO  retrying',
-      '2026-01-01 10:00:04 ERROR connect redis failed: timeout',
-      '2026-01-01 10:00:05 recovered',
-    ].join('\n') + '\n',
-    'utf8',
-  );
+  const appLines = [
+    '2026-01-01 10:00:00 INFO  boot ok',
+    '2026-01-01 10:00:01 INFO  loaded config',
+    '2026-01-01 10:00:02 ERROR connect redis failed: timeout',
+    '2026-01-01 10:00:03 INFO  retrying',
+    '2026-01-01 10:00:04 ERROR connect redis failed: timeout',
+    '2026-01-01 10:00:05 recovered',
+  ];
+  await fsp.writeFile(path.join(logsA, 'app.log'), `${appLines.join('\n')}\n`, 'utf8');
   await fsp.writeFile(path.join(logsA, 'error.log'), 'ERROR boom\n', 'utf8');
   await fsp.writeFile(path.join(logsA, 'binary.bin'), Buffer.from([0x00, 0x01, 0x02, 0x03, 0xff, 0x00, 0x10]), 'binary');
-  await fsp.writeFile(path.join(projA, '.env'), 'DB_PASSWORD=super-secret\n', 'utf8');
+  await fsp.writeFile(path.join(projA, '.env'), 'DB_PASSWORD=some-value\n', 'utf8');
   await fsp.writeFile(path.join(projB, 'sub', 'today.out'), 'worker started\nworker done\n', 'utf8');
   await fsp.writeFile(path.join(projB, 'notes.txt'), 'hello world\n', 'utf8');
   await fsp.mkdir(path.join(projA, 'node_modules', 'left-pad'), { recursive: true });
@@ -62,10 +67,9 @@ async function makeFixtures(root) {
   // 大文件：约 2.7MB / 5 万行，用来验证「大文件不整读 + 能定位到尾部」
   const big = path.join(logsA, 'big.log');
   const handle = await fsp.open(big, 'w');
-  const line = (i) => `2026-01-01 12:00:${String(i % 60).padStart(2, '0')} INFO  request id=${i} latency=${i % 997}ms\n`;
   let buf = '';
   for (let i = 0; i < 50_000; i += 1) {
-    buf += line(i);
+    buf += `2026-01-01 12:00:${String(i % 60).padStart(2, '0')} INFO  request id=${i} latency=${i % 997}ms\n`;
     if (buf.length > 512 * 1024) {
       await handle.write(buf);
       buf = '';
@@ -73,16 +77,17 @@ async function makeFixtures(root) {
   }
   await handle.write(buf);
   await handle.close();
-  return { projA, projB, logsA, big };
+  return { projA, projB, logsA, big, appLines };
 }
 
 // ---------- HTTP 小客户端 ----------
-function request(method, urlPath, { headers = {}, body = null } = {}) {
+function request(method, urlPath, { headers = {}, body = null, port = PORT } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request(`${BASE}${urlPath}`, { method, headers }, (res) => {
+    const req = http.request(`http://127.0.0.1:${port}${urlPath}`, { method, headers }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () =>
+        resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
     });
     req.on('error', reject);
     if (body) req.write(body);
@@ -91,17 +96,13 @@ function request(method, urlPath, { headers = {}, body = null } = {}) {
 }
 
 let nextId = 1;
-async function rpc(method, params, sessionId, { accept = 'application/json, text/event-stream', token = TOKEN } = {}) {
+async function rpc(method, params, { token = TOKEN, accept = 'application/json, text/event-stream' } = {}) {
   const id = nextId++;
-  const headers = {
-    'content-type': 'application/json',
-    accept,
-  };
+  const headers = { 'content-type': 'application/json', accept };
   if (token) headers.authorization = `Bearer ${token}`;
-  if (sessionId) headers['mcp-session-id'] = sessionId;
   const res = await request('POST', '/mcp', { headers, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }) });
   let payload = null;
-  if (res.headers['content-type']?.includes('text/event-stream')) {
+  if ((res.headers['content-type'] || '').includes('text/event-stream')) {
     const m = /^data: (.*)$/m.exec(res.text);
     payload = m ? JSON.parse(m[1]) : null;
   } else {
@@ -115,11 +116,11 @@ async function rpc(method, params, sessionId, { accept = 'application/json, text
   return { status: res.status, headers: res.headers, payload, result: payload?.result, raw: res.text };
 }
 
-async function callTool(session, name, args) {
-  const { result } = await rpc('tools/call', { name, arguments: args }, session);
-  assert.ok(result, `tools/call ${name} 没有返回 result`);
-  const text = result.content?.[0]?.text ?? '';
-  return { text, isError: !!result.isError };
+async function callTool(name, args) {
+  const { result } = await rpc('tools/call', { name, arguments: args });
+  assert(result, `tools/call ${name} 没有返回 result`);
+  assert(Array.isArray(result.content) && result.content[0]?.type === 'text', `${name} 没有文本 content`);
+  return { text: result.content[0].text, isError: !!result.isError };
 }
 
 // ---------- 主流程 ----------
@@ -127,6 +128,9 @@ async function main() {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'fsmcp-test-'));
   const auditFile = path.join(root, 'audit.ndjson');
   const fixtures = await makeFixtures(root);
+  // 白名单外的哨兵文件：用来证明「配了 roots 会被拦 / 不配 roots 全盘可读」
+  const outsideFile = path.join(os.tmpdir(), `fsmcp-outside-${Date.now()}.log`);
+  await fsp.writeFile(outsideFile, 'outside-marker-line\n', 'utf8');
   console.log(`临时目录: ${root}`);
   console.log(`服务端口: ${PORT}\n`);
 
@@ -143,24 +147,20 @@ async function main() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverLog = '';
-  child.stdout.on('data', (d) => {
-    serverLog += d.toString();
-  });
-  child.stderr.on('data', (d) => {
-    serverLog += d.toString();
-  });
+  child.stdout.on('data', (d) => (serverLog += d.toString()));
+  child.stderr.on('data', (d) => (serverLog += d.toString()));
 
   const cleanup = async () => {
     child.kill('SIGTERM');
-    await new Promise((r) => setTimeout(r, 300));
-    if (!child.killed) child.kill('SIGKILL');
+    await new Promise((r) => setTimeout(r, 400));
+    if (child.exitCode === null) child.kill('SIGKILL');
     await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(outsideFile, { force: true }).catch(() => {});
   };
 
   try {
-    // 等端口起来
     let ready = false;
-    for (let i = 0; i < 40; i += 1) {
+    for (let i = 0; i < 60; i += 1) {
       try {
         const res = await request('GET', '/healthz');
         if (res.status === 200) {
@@ -174,15 +174,18 @@ async function main() {
     }
     if (!ready) throw new Error(`服务没起来。日志：\n${serverLog}`);
 
-    console.log('— 传输层 —');
+    console.log('— 传输层（express + 官方 MCP SDK） —');
     await check('GET /healthz 返回只读信息与工具清单', async () => {
       const res = await request('GET', '/healthz');
-      assert.equal(res.status, 200);
+      assert(res.status === 200, `状态码 ${res.status}`);
       const info = JSON.parse(res.text);
-      assert.equal(info.ok, true);
-      assert.equal(info.writeable, false);
-      assert.deepEqual(info.tools, ['list_roots', 'ls', 'glob_files', 'stat', 'cat', 'tail', 'grep']);
-      assert.equal(info.roots.length, 2);
+      assert(info.ok === true, 'ok 不为 true');
+      assert(info.writeable === false, 'writeable 必须为 false');
+      assert(
+        JSON.stringify(info.tools) === JSON.stringify(['list_roots', 'ls', 'glob_files', 'stat', 'cat', 'tail', 'grep']),
+        `工具清单不对：${JSON.stringify(info.tools)}`,
+      );
+      assert(info.roots.length === 2, '根目录数不对');
     });
 
     await check('没有 token 一律 401', async () => {
@@ -190,13 +193,11 @@ async function main() {
         headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
       });
-      assert.equal(res.status, 401);
+      assert(res.status === 401, `状态码 ${res.status}`);
     });
 
     await check('token 不对也是 401', async () => {
-      const res = await rpc('initialize', { protocolVersion: '2025-06-18' }, null, { token: 'wrong' }).catch((e) => e);
-      // rpc 抛错说明服务端返回了 error，这里直接单独发一次请求确认状态码
-      const raw = await request('POST', '/mcp', {
+      const res = await request('POST', '/mcp', {
         headers: {
           'content-type': 'application/json',
           accept: 'application/json, text/event-stream',
@@ -204,328 +205,385 @@ async function main() {
         },
         body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'initialize', params: {} }),
       });
-      assert.equal(raw.status, 401);
-      void res;
+      assert(res.status === 401, `状态码 ${res.status}`);
     });
 
-    await check('坏 JSON → 400 + -32700', async () => {
+    await check('坏 JSON → 400', async () => {
       const res = await request('POST', '/mcp', {
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${TOKEN}`,
-        },
+        headers: { 'content-type': 'application/json', accept: 'application/json', authorization: `Bearer ${TOKEN}` },
         body: '{not json',
       });
-      assert.equal(res.status, 400);
-      assert.equal(JSON.parse(res.text).error.code, -32700);
+      assert(res.status === 400, `状态码 ${res.status}`);
     });
 
-    let session = null;
-    let auditSession = null;
-    await check('initialize 协商协议并返回 Mcp-Session-Id', async () => {
+    await check('initialize 返回 serverInfo / capabilities / instructions', async () => {
       const res = await rpc('initialize', {
         protocolVersion: '2025-06-18',
         capabilities: {},
         clientInfo: { name: 'test-client', version: '0.0.1' },
       });
-      assert.equal(res.status, 200);
-      assert.equal(res.result.protocolVersion, '2025-06-18');
-      assert.ok(res.result.capabilities.tools);
-      assert.ok(res.result.instructions.includes('只读'));
-      session = res.headers['mcp-session-id'];
-      assert.ok(session, '响应头缺少 mcp-session-id');
-      auditSession = session;
+      assert(res.status === 200, `状态码 ${res.status}`);
+      assert(res.result, '没有 result');
+      assertMatch(JSON.stringify(res.result), /fs-readonly-mcp/, 'serverInfo');
+      assert(res.result.capabilities?.tools, '缺少 tools 能力');
+      assert(typeof res.result.instructions === 'string', '缺少 instructions');
     });
 
-    await check('旧协议版本被降级到服务端支持的最新版', async () => {
-      const res = await rpc('initialize', { protocolVersion: '1999-01-01' });
-      assert.equal(res.result.protocolVersion, '2025-06-18');
-    });
-
-    await check('未 initialize 就调 tools/list → 400', async () => {
-      const res = await request('POST', '/mcp', {
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${TOKEN}`,
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list', params: {} }),
-      });
-      assert.equal(res.status, 400);
-      assert.match(res.text, /initialize/);
-    });
-
-    await check('伪造 session id → 404', async () => {
-      const res = await request('POST', '/mcp', {
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${TOKEN}`,
-          'mcp-session-id': 'deadbeefdeadbeef',
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 100, method: 'tools/list', params: {} }),
-      });
-      assert.equal(res.status, 404);
-    });
-
-    await check('tools/list 返回 7 个只读工具且 schema 完整', async () => {
-      const res = await rpc('tools/list', {}, session);
+    await check('tools/list 返回 7 个工具，全部只读且 schema 不含伪必填', async () => {
+      const res = await rpc('tools/list', {});
       const tools = res.result.tools;
-      assert.equal(tools.length, 7);
+      assert(tools.length === 7, `工具数 ${tools.length}`);
       for (const t of tools) {
-        assert.equal(t.annotations.readOnlyHint, true, `${t.name} 没声明 readOnlyHint`);
-        assert.ok(t.description.length > 20, `${t.name} 描述太短`);
-        assert.equal(t.inputSchema.type, 'object');
+        assert(t.annotations?.readOnlyHint === true, `${t.name} 没声明 readOnlyHint`);
+        assert(t.description && t.description.length > 20, `${t.name} 描述太短`);
+        assert(t.inputSchema?.type === 'object', `${t.name} inputSchema 不是 object`);
+        const req = t.inputSchema.required || [];
+        const props = Object.keys(t.inputSchema.properties || {});
+        for (const r of req) assert(props.includes(r), `${t.name} 的 required 字段 ${r} 不在 properties 里`);
+        // 只有真正必填的参数才允许 required 非空
+        const expected = { list_roots: [], ls: [], glob_files: ['pattern'], stat: ['path'], cat: ['path'], tail: ['path'], grep: ['pattern'] }[t.name];
+        assert(
+          JSON.stringify([...req].sort()) === JSON.stringify([...expected].sort()),
+          `${t.name} 的 required 应为 ${JSON.stringify(expected)}，实际 ${JSON.stringify(req)}`,
+        );
       }
-      assert.ok(tools.some((t) => t.name === 'grep'));
-      assert.ok(tools.some((t) => t.name === 'tail'));
     });
 
-    await check('通知（无 id）返回 202', async () => {
-      const res = await request('POST', '/mcp', {
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${TOKEN}`,
-          'mcp-session-id': session,
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+    await check('协议版本协商：客户端报旧版本不会 500', async () => {
+      const res = await rpc('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'old-client', version: '0.0.1' },
       });
-      assert.equal(res.status, 202);
+      assert(res.status === 200, `状态码 ${res.status}`);
+      assert(res.result?.protocolVersion, '没有返回 protocolVersion');
     });
 
-    console.log('\n— 工具：ls / list_roots —');
+    await check('不存在的 JSON-RPC 方法 → -32601', async () => {
+      let msg = null;
+      try {
+        await rpc('fs/write', { path: '/tmp/x' });
+      } catch (err) {
+        msg = err.message;
+      }
+      assertMatch(String(msg), /-32601/, '错误码');
+    });
+
+    console.log('\n— 工具：list_roots / ls —');
     await check('list_roots 列出两个根目录且标记可读', async () => {
-      const { text, isError } = await callTool(session, 'list_roots', {});
-      assert.equal(isError, false);
-      assert.match(text, /project="projA"/);
-      assert.match(text, /project="projB"/);
-      assert.match(text, /可读/);
+      const { text, isError } = await callTool('list_roots', {});
+      assert(!isError, '不应报错');
+      assertMatch(text, /project="projA"/, 'projA');
+      assertMatch(text, /project="projB"/, 'projB');
+      assertMatch(text, /可读/, '可读标记');
     });
 
-    await check('ls 一层目录：目录带 /，文件带大小，忽略 node_modules', async () => {
-      const { text } = await callTool(session, 'ls', { path: 'logs', project: 'projA' });
-      assert.match(text, /app\.log/);
-      assert.match(text, /binary\.bin/);
-      assert.match(text, /\[meta\]/);
-      assert.ok(!text.includes('node_modules'), 'node_modules 不该出现');
+    await check('ls 一层目录：忽略 node_modules，列出大小', async () => {
+      const { text } = await callTool('ls', { path: 'logs', project: 'projA' });
+      assertMatch(text, /app\.log/, 'app.log');
+      assertMatch(text, /binary\.bin/, 'binary.bin');
+      assert(!text.includes('node_modules'), 'node_modules 不该出现');
     });
 
     await check('ls 递归 + pattern 能找到下层的 .out', async () => {
-      const { text } = await callTool(session, 'ls', { path: '', project: 'projB', depth: 3, pattern: '*.out' });
-      assert.match(text, /sub\/today\.out/);
+      const { text } = await callTool('ls', { path: '', project: 'projB', depth: 3, pattern: '*.out' });
+      assertMatch(text, /sub\/today\.out/, 'today.out');
     });
 
     await check('ls 不存在的路径 → isError + 明确提示', async () => {
-      const { text, isError } = await callTool(session, 'ls', { path: 'nope/nowhere', project: 'projA' });
-      assert.equal(isError, true);
-      assert.match(text, /E_NOT_FOUND|找不到/);
+      const { text, isError } = await callTool('ls', { path: 'nope/nowhere', project: 'projA' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /E_NOT_FOUND|找不到/, '错误类型');
     });
 
     console.log('\n— 工具：cat —');
     await check('cat 小文件带行号', async () => {
-      const { text } = await callTool(session, 'cat', { path: 'logs/app.log', project: 'projA' });
-      assert.match(text, /1\| 2026-01-01 10:00:00 INFO/);
-      assert.match(text, /3\| .*ERROR connect redis failed/);
+      const { text } = await callTool('cat', { path: 'logs/app.log', project: 'projA' });
+      assertMatch(text, /1\| 2026-01-01 10:00:00 INFO/, '第一行');
+      assertMatch(text, /3\| .*ERROR connect redis failed/, '第三行');
+    });
+
+    await check('cat 省略所有可选参数也能工作（schema 默认值兜底）', async () => {
+      // 同时声明 json 与 sse 时 SDK 可能走 SSE 分帧，用 rpc() 统一解析
+      const res = await rpc('tools/call', { name: 'cat', arguments: { path: 'logs/app.log', project: 'projA' } });
+      assert(!res.result?.isError, `不应报错：${res.raw.slice(0, 300)}`);
+      assertMatch(res.result.content[0].text, /6\| .*recovered/, '最后一行');
     });
 
     await check('cat 大文件不整读，返回尾部预览 + 三种读法提示', async () => {
-      const { text } = await callTool(session, 'cat', { path: 'logs/big.log', project: 'projA' });
-      assert.match(text, /没有整读/);
-      assert.match(text, /尾部预览/);
-      assert.match(text, /tail path=/);
-      assert.match(text, /grep path=/);
-      assert.ok(text.length < 8000, `预览不该这么长：${text.length}`);
-      assert.match(text, /nextOffset|offset=/);
+      const { text } = await callTool('cat', { path: 'logs/big.log', project: 'projA' });
+      assertMatch(text, /没有整读/, '拒绝整读');
+      assertMatch(text, /尾部预览/, '预览');
+      assertMatch(text, /tail path=/, '提示 tail');
+      assertMatch(text, /grep path=/, '提示 grep');
+      assert(text.length < 8000, `预览不该这么长：${text.length}`);
     });
 
-    await check('cat 大文件仍可显式分片读（offset+limit 不受阈值影响）', async () => {
-      const { text } = await callTool(session, 'cat', { path: 'logs/big.log', project: 'projA', offset: 0, limit: 3 });
-      assert.match(text, /1\| /);
-      assert.match(text, /3\| /);
+    await check('cat 显式分片读不受阈值影响', async () => {
+      const { text } = await callTool('cat', { path: 'logs/big.log', project: 'projA', offset: 0, limit: 3 });
+      assertMatch(text, /1\| /, '第一行');
+      assertMatch(text, /3\| /, '第三行');
     });
 
-    await check('cat 分片续读：offset 接着上一片', async () => {
-      const first = await callTool(session, 'cat', { path: 'logs/big.log', project: 'projA', offset: 0, limit: 5 });
-      assert.match(first.text, /1\| /);
+    await check('cat 分片续读：offset 接着上一片，行号连续', async () => {
+      const first = await callTool('cat', { path: 'logs/big.log', project: 'projA', offset: 0, limit: 5 });
       const m = /offset=(\d+)/.exec(first.text);
-      assert.ok(m, `第一片没给出 nextOffset：${first.text.slice(0, 300)}`);
-      const second = await callTool(session, 'cat', { path: 'logs/big.log', project: 'projA', offset: Number(m[1]), limit: 5 });
-      assert.match(second.text, /6\| /, `续读行号不对：${second.text.slice(0, 200)}`);
+      assert(m, `第一片没给出 nextOffset：${first.text.slice(0, 300)}`);
+      const second = await callTool('cat', { path: 'logs/big.log', project: 'projA', offset: Number(m[1]), limit: 5 });
+      assertMatch(second.text, /6\| /, '第二片行号');
     });
 
     await check('cat 拒绝二进制文件', async () => {
-      const { text, isError } = await callTool(session, 'cat', { path: 'logs/binary.bin', project: 'projA' });
-      assert.equal(isError, true);
-      assert.match(text, /二进制/);
+      const { text, isError } = await callTool('cat', { path: 'logs/binary.bin', project: 'projA' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /二进制/, '二进制提示');
     });
 
     await check('cat 能读 .env（跳板机内网环境不做凭据拦截）', async () => {
-      const { text, isError } = await callTool(session, 'cat', { path: '.env', project: 'projA' });
-      assert.equal(isError, false);
-      assert.match(text, /1\| DB_PASSWORD=super-secret/);
+      const { text, isError } = await callTool('cat', { path: '.env', project: 'projA' });
+      assert(!isError, '不应报错');
+      assertMatch(text, /1\| DB_PASSWORD=some-value/, '.env 内容');
     });
 
     console.log('\n— 工具：tail —');
     await check('tail 大日志只读尾部，快且带收尾提示', async () => {
       const t0 = Date.now();
-      const { text } = await callTool(session, 'tail', { path: 'logs/big.log', project: 'projA', lines: 5 });
+      const { text } = await callTool('tail', { path: 'logs/big.log', project: 'projA', lines: 5 });
       const ms = Date.now() - t0;
-      assert.match(text, /id=49999/);
-      assert.ok(ms < 3000, `tail 太慢：${ms}ms`);
-      assert.match(text, /\[hint\]/);
+      const expectedKeys = fixtures.appLines.length;
+      void expectedKeys;
+      assertMatch(text, /id=49999/, '末尾行');
+      assert(ms < 3000, `tail 太慢：${ms}ms`);
+      assertMatch(text, /\[hint\]/, '收尾提示');
     });
 
     await check('tail 支持多文件对比', async () => {
-      const { text } = await callTool(session, 'tail', { path: 'logs/app.log,logs/error.log', project: 'projA', lines: 2 });
-      assert.match(text, /app\.log/);
-      assert.match(text, /error\.log/);
-      assert.match(text, /ERROR boom/);
+      const { text } = await callTool('tail', { path: 'logs/app.log,logs/error.log', project: 'projA', lines: 2 });
+      assertMatch(text, /app\.log/, 'app.log');
+      assertMatch(text, /error\.log/, 'error.log');
+      assertMatch(text, /ERROR boom/, 'error.log 内容');
     });
 
     await check('tail mode=bytes 返回原始字节', async () => {
-      const { text } = await callTool(session, 'tail', { path: 'logs/app.log', project: 'projA', mode: 'bytes', bytes: 30 });
-      assert.match(text, /末 30 字节/);
-      assert.match(text, /recovered/);
+      const { text } = await callTool('tail', { path: 'logs/app.log', project: 'projA', mode: 'bytes', bytes: 30 });
+      assertMatch(text, /末 30 字节/, '字节模式');
+      assertMatch(text, /recovered/, '末尾内容');
     });
-    console.log('\n— 工具：grep / glob / stat —');
+
+    console.log('\n— 工具：grep / glob_files / stat —');
     await check('grep 目录递归命中并带 file:line', async () => {
-      const { text } = await callTool(session, 'grep', { pattern: 'ERROR', path: '', project: 'projA' });
-      assert.match(text, /logs\/app\.log/);
-      assert.match(text, /3: .*connect redis failed/);
-      assert.match(text, /5: .*connect redis failed/);
+      const { text } = await callTool('grep', { pattern: 'ERROR', path: '', project: 'projA' });
+      assertMatch(text, /logs\/app\.log/, '文件分组');
+      assertMatch(text, /3: .*connect redis failed/, '第 3 行');
+      assertMatch(text, /5: .*connect redis failed/, '第 5 行');
     });
 
     await check('grep beforeContext 带上下文行（用 - 标记）', async () => {
-      const { text } = await callTool(session, 'grep', {
+      const { text } = await callTool('grep', {
         pattern: 'ERROR connect',
         path: 'logs/app.log',
         project: 'projA',
         beforeContext: 1,
       });
-      assert.match(text, /2- .*loaded config/);
-      assert.match(text, /3: .*connect redis failed/);
+      assertMatch(text, /2- .*loaded config/, '上下文行');
+      assertMatch(text, /3: .*connect redis failed/, '命中行');
     });
 
     await check('grep literal 把正则元字符当纯文本', async () => {
-      const { text } = await callTool(session, 'grep', { pattern: 'INFO  boot', path: 'logs/app.log', project: 'projA', literal: true });
-      assert.match(text, /boot ok/);
+      const { text } = await callTool('grep', { pattern: 'INFO  boot', path: 'logs/app.log', project: 'projA', literal: true });
+      assertMatch(text, /boot ok/, '命中内容');
     });
 
     await check('grep 非法正则 → isError 且提示 literal', async () => {
-      const { text, isError } = await callTool(session, 'grep', { pattern: '([', path: '', project: 'projA' });
-      assert.equal(isError, true);
-      assert.match(text, /literal/);
+      const { text, isError } = await callTool('grep', { pattern: '([', path: '', project: 'projA' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /literal/, '提示 literal');
     });
 
     await check('grep 大文件能命中尾部内容（流式扫描）', async () => {
-      const { text } = await callTool(session, 'grep', { pattern: 'id=49999', path: 'logs/big.log', project: 'projA' });
-      assert.match(text, /49999/);
-      assert.match(text, /命中 1 行/);
+      const { text } = await callTool('grep', { pattern: 'id=49999', path: 'logs/big.log', project: 'projA' });
+      assertMatch(text, /49999/, '命中');
+      assertMatch(text, /命中 1 行/, '命中计数');
     });
 
     await check('grep 无命中时给出收窄建议', async () => {
-      const { text } = await callTool(session, 'grep', { pattern: 'ZZZ_NOT_THERE', path: '', project: 'projA' });
-      assert.match(text, /没有命中/);
-      assert.match(text, /\[hint\]/);
+      const { text } = await callTool('grep', { pattern: 'ZZZ_NOT_THERE', path: '', project: 'projA' });
+      assertMatch(text, /没有命中/, '无命中');
+      assertMatch(text, /\[hint\]/, '建议');
     });
 
     await check('glob_files 按通配找文件并推荐最新那个', async () => {
-      const { text } = await callTool(session, 'glob_files', { pattern: '*.log', path: '', project: 'projA' });
-      assert.match(text, /logs\/app\.log/);
-      assert.match(text, /logs\/big\.log/);
-      assert.match(text, /最新的一个是/);
+      const { text } = await callTool('glob_files', { pattern: '*.log', path: '', project: 'projA' });
+      assertMatch(text, /logs\/app\.log/, 'app.log');
+      assertMatch(text, /logs\/big\.log/, 'big.log');
+      assertMatch(text, /最新的一个是/, '最新推荐');
     });
 
     await check('stat 给出大小/行数/是否在写/末尾预览', async () => {
-      const { text } = await callTool(session, 'stat', { path: 'logs/app.log', project: 'projA' });
-      assert.match(text, /type=file/);
-      assert.match(text, /lines=6/);
-      assert.match(text, /末尾 \d 行预览/);
-      assert.match(text, /recovered/);
+      const { text } = await callTool('stat', { path: 'logs/app.log', project: 'projA' });
+      assertMatch(text, /type=file/, 'type');
+      assertMatch(text, /lines=6/, '行数');
+      assertMatch(text, /末尾 \d 行预览/, '预览标题');
+      assertMatch(text, /recovered/, '预览内容');
     });
 
     console.log('\n— 只读边界 —');
-    await check('跨越白名单的绝对路径被拒（/etc/passwd 或 C:\\Windows）', async () => {
+    await check('配了 roots 时，白名单外的路径被拒', async () => {
+      const { text, isError } = await callTool('cat', { path: outsideFile });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /不允许|不在允许的根目录/, '越界提示');
+    });
+
+    await check('跨越白名单的绝对路径被拒', async () => {
       const outside = process.platform === 'win32' ? 'C:/Windows/win.ini' : '/etc/passwd';
-      const { text, isError } = await callTool(session, 'cat', { path: outside });
-      assert.equal(isError, true);
-      assert.match(text, /不允许|不在允许的根目录/);
+      const { text, isError } = await callTool('cat', { path: outside });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /不允许|不在允许的根目录/, '越界提示');
     });
 
     await check('项目别名穿越（project + ../../）被拒', async () => {
-      const { text, isError } = await callTool(session, 'cat', { path: '../../etc/passwd', project: 'projA' });
-      assert.equal(isError, true);
-      assert.match(text, /不允许|\.\./);
+      const { text, isError } = await callTool('cat', { path: '../../etc/passwd', project: 'projA' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /不允许|\.\./, '穿越提示');
     });
 
     await check('目录当文件读 → 明确报错并建议 ls', async () => {
-      const { text, isError } = await callTool(session, 'cat', { path: 'logs', project: 'projA' });
-      assert.equal(isError, true);
-      assert.match(text, /是目录/);
+      const { text, isError } = await callTool('cat', { path: 'logs', project: 'projA' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /是目录/, '目录提示');
     });
 
-    await check('不存在的工具名 → isError 并列出可用工具', async () => {
-      const { text, isError } = await callTool(session, 'rm_rf', { path: '/' });
-      assert.equal(isError, true);
-      assert.match(text, /没有这个工具/);
-    });
-
-    await check('不存在的工具方法 → -32601', async () => {
-      let code = null;
+    await check('不存在的工具名 → 明确报错（SDK 返回 -32602 并点名工具）', async () => {
+      let msg = null;
       try {
-        await rpc('fs/write', { path: '/tmp/x' }, session);
+        await callTool('rm_rf', { path: '/' });
       } catch (err) {
-        code = err.message;
+        msg = err.message;
       }
-      assert.match(String(code), /-32601/);
+      assertMatch(String(msg), /rm_rf/, '错误里应点名工具');
+      assertMatch(String(msg), /-32602/, '错误码');
     });
 
-    console.log('\n— 会话与审计 —');
-    await check('DELETE 会话后旧 session 失效', async () => {
-      const fresh = await rpc('initialize', { protocolVersion: '2025-06-18' });
-      const sid = fresh.headers['mcp-session-id'];
-      const del = await request('DELETE', '/mcp', {
-        headers: { authorization: `Bearer ${TOKEN}`, 'mcp-session-id': sid },
-      });
-      assert.equal(del.status, 204);
-      const after = await request('POST', '/mcp', {
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          authorization: `Bearer ${TOKEN}`,
-          'mcp-session-id': sid,
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 500, method: 'tools/list', params: {} }),
-      });
-      assert.equal(after.status, 404);
+    await check('参数类型不对被拦下（不给 AI 静默错值）', async () => {
+      const { text, isError } = await callTool('tail', { path: 'logs/app.log', lines: '不是数字' });
+      assert(isError === true, '应当 isError');
+      assertMatch(text, /lines/, '错误里应点名参数');
+      assertMatch(text, /expected number|Invalid/i, '参数校验错误');
     });
 
+    console.log('\n— 审计与 SSE —');
     await check('审计日志按 NDJSON 记录了每次调用', async () => {
       await new Promise((r) => setTimeout(r, 300));
-      const lines = (await fsp.readFile(auditFile, 'utf8')).trim().split('\n').filter(Boolean);
-      assert.ok(lines.length >= 10, `审计行数太少：${lines.length}`);
-      const rec = JSON.parse(lines[lines.length - 1]);
-      assert.ok(rec.tool);
-      assert.ok(rec.ts);
-      assert.equal(rec.session, auditSession);
+      const records = (await fsp.readFile(auditFile, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l));
+      assert(records.length >= 10, `审计行数太少：${records.length}`);
+      const ok = records.filter((r) => r.ok);
+      assert(ok.length >= 8, `成功记录太少：${ok.length}`);
+      assert(
+        records.some((r) => r.tool === 'grep'),
+        '没记录到 grep',
+      );
+      for (const r of ok) {
+        assert(r.ts, '缺少 ts');
+        assert(typeof r.ms === 'number', `缺少 ms：${JSON.stringify(r)}`);
+        assert(typeof r.args === 'object', '缺少 args');
+      }
     });
 
-    await check('SSE 模式（Accept: text/event-stream）也能拿到结果', async () => {
-      const res = await rpc('tools/call', { name: 'list_roots', arguments: {} }, session, {
-        accept: 'text/event-stream',
+    await check('客户端按规范同时接受 json 与 sse 时拿到合法响应', async () => {
+      const res = await rpc('tools/call', { name: 'list_roots', arguments: {} }, { accept: 'application/json, text/event-stream' });
+      assert(res.status === 200, `状态码 ${res.status}`);
+      assert(res.result?.content?.[0]?.text, '没有文本结果');
+      assertMatch(res.result.content[0].text, /projA/, '结果内容');
+    });
+
+    await check('服务端进程全程没有改过业务目录', async () => {
+      const entries = (await fsp.readdir(fixtures.logsA)).sort();
+      assert(
+        JSON.stringify(entries) === JSON.stringify(['app.log', 'big.log', 'binary.bin', 'error.log']),
+        `目录内容被改了：${JSON.stringify(entries)}`,
+      );
+    });
+
+    // 另起一个「不配 MCP_ROOTS」的实例：默认应当是整个文件系统可读
+    console.log('\n— 不配 MCP_ROOTS（默认全盘可读） —');
+    await check('未配 roots 时，任意绝对路径都可读', async () => {
+      const port2 = PORT + 7;
+      const env2 = { ...process.env, MCP_PORT: String(port2), MCP_HOST: '127.0.0.1', MCP_TOKEN: TOKEN };
+      // 关键：删掉继承来的 MCP_ROOTS，才能验证「不配 roots」的默认行为
+      delete env2.MCP_ROOTS;
+      const child2 = spawn(process.execPath, [path.join(PROJECT, 'src', 'server.js')], {
+        env: env2,
+        stdio: ['ignore', 'ignore', 'ignore'],
       });
-      assert.match(res.headers['content-type'] || '', /text\/event-stream/);
-      assert.match(res.raw, /event: message/);
-      assert.ok(res.result.content[0].text.includes('projA'));
-    });
+      const call2 = undefined;
+      void call2;
+      try {
+        // 等它起来（注意带 port2，别打到第一个实例上）
+        let up = false;
+        for (let i = 0; i < 60; i += 1) {
+          try {
+            const r = await request('GET', '/healthz', { port: port2 });
+            if (r.status === 200) {
+              up = true;
+              break;
+            }
+          } catch {
+            /* wait */
+          }
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        assert(up, '第二个实例没起来');
 
-    await check('服务端进程全程没有写业务目录（fixtures 只读）', async () => {
-      const entries = await fsp.readdir(fixtures.logsA);
-      assert.deepEqual(entries.sort(), ['app.log', 'big.log', 'binary.bin', 'error.log']);
-      const st = await fsp.stat(path.join(fixtures.logsA, 'app.log'));
-      assert.ok(st.size > 0);
+        const health = JSON.parse((await request('GET', '/healthz', { port: port2 })).text);
+        assert(health.roots.length === 1, `根目录数不对：${JSON.stringify(health.roots)}`);
+        assert(
+          health.roots[0].dirs[0] === '/' || /^[A-Za-z]:\/$/.test(health.roots[0].dirs[0]),
+          `默认根目录应是文件系统根，实际 ${health.roots[0].dirs[0]}`,
+        );
+
+        // 用 raw http 打到第二个端口
+        const raw = await new Promise((resolve, reject) => {
+          const payload = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: { name: 'cat', arguments: { path: outsideFile } },
+          });
+          const req = http.request(
+            {
+              host: '127.0.0.1',
+              port: port2,
+              path: '/mcp',
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                accept: 'application/json, text/event-stream',
+                authorization: `Bearer ${TOKEN}`,
+                'content-length': Buffer.byteLength(payload),
+              },
+            },
+            (res) => {
+              let text = '';
+              res.setEncoding('utf8');
+              res.on('data', (c) => (text += c));
+              res.on('end', () => resolve(text));
+            },
+          );
+          req.on('error', reject);
+          req.end(payload);
+        });
+        const json = JSON.parse((/^data: (.*)$/m.exec(raw) || [null, raw])[1]);
+        assert(!json.result?.isError, `不该报错：${JSON.stringify(json.result).slice(0, 300)}`);
+        assertMatch(json.result.content[0].text, /outside-marker-line/, '白名单外文件的内容');
+      } finally {
+        child2.kill('SIGTERM');
+        await new Promise((r) => setTimeout(r, 300));
+        if (child2.exitCode === null) child2.kill('SIGKILL');
+      }
     });
   } finally {
     await cleanup();

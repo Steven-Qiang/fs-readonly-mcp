@@ -1,0 +1,34 @@
+# 可选：nginx 反代 + 对外只暴露一个端口
+#
+# 关键两点：
+#   1) proxy_buffering off —— MCP 的 SSE 流式响应必须实时下发，否则 nginx 会攒着不发，客户端卡死
+#   2) proxy_read_timeout 调大 —— grep 扫大日志可能跑几十秒
+#
+# 如果 AI 客户端能直连 7801，这一层可以不加。
+# 下面的域名和端口都是示例，按实际情况改。
+
+server {
+    listen 80;
+    server_name mcp.example.com;   # 换成你的域名；没有就写 IP，或直接删掉这行
+
+    location /mcp {
+        proxy_pass http://127.0.0.1:7801;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Connection "";
+
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # MCP 的会话/协议头直接透传，不要改写
+        proxy_pass_request_headers on;
+    }
+
+    location /healthz {
+        proxy_pass http://127.0.0.1:7801;
+        access_log off;
+    }
+}

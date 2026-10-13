@@ -1,6 +1,6 @@
-// 工具基座：统一的输出格式（[meta] 元信息 / 正文 / [hint] 下一步动作）与参数解析。
+// 工具基座：统一的输出格式（[meta] 元信息 / 正文 / [hint] 下一步动作）。
 // 输出纪律：任何被截断的结果都必须带 [hint]，明确告诉 AI 下一步该用什么参数继续，而不是让它瞎猜。
-import { ToolError, formatBytes, toPosix, truncateText } from '../util.js';
+import { ToolError, truncateText } from '../util.js';
 
 export class Out {
   constructor(meta = {}, { maxChars = 64000 } = {}) {
@@ -41,63 +41,66 @@ export class Out {
   }
 }
 
-export function num(args, key, fallback, { min, max } = {}) {
-  const raw = args?.[key];
-  if (raw === undefined || raw === null || raw === '') return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) {
-    throw new ToolError(`参数 ${key} 必须是数字，收到：${JSON.stringify(raw)}`, { code: 'E_PARAM' });
-  }
-  let v = Math.trunc(n);
-  if (min !== undefined) v = Math.max(min, v);
-  if (max !== undefined) v = Math.min(max, v);
-  return v;
+export function makeDeadline(budgetMs) {
+  const started = Date.now();
+  return {
+    budgetMs,
+    expired: () => Date.now() - started > budgetMs,
+    elapsed: () => Date.now() - started,
+  };
 }
 
-export function str(args, key, fallback = undefined) {
-  const raw = args?.[key];
-  if (raw === undefined || raw === null) return fallback;
-  return String(raw);
+/** 参数被 zod 拒绝时，给 AI 一份「能直接照抄」的修正提示 */
+function describeIssues(error) {
+  const issues = error?.issues || [];
+  if (issues.length === 0) return String(error?.message || error);
+  return issues
+    .map((i) => {
+      const where = Array.isArray(i.path) && i.path.length ? i.path.join('.') : '(入参)';
+      return `${where}: ${i.message}`;
+    })
+    .join('；');
 }
 
-export function bool(args, key, fallback = false) {
-  const raw = args?.[key];
-  if (raw === undefined || raw === null || raw === '') return fallback;
-  if (typeof raw === 'boolean') return raw;
-  const s = String(raw).toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(s)) return true;
-  if (['0', 'false', 'no', 'off'].includes(s)) return false;
-  return fallback;
-}
-
-export function compileRegex(pattern, { ignoreCase = true, literal = false } = {}) {
-  if (!pattern) return null;
-  const src = literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : pattern;
-  try {
-    return new RegExp(src, ignoreCase ? 'i' : '');
-  } catch (err) {
-    throw new ToolError(`正则不合法：${pattern} → ${err.message}`, {
-      code: 'E_REGEX',
-      hint: '改用 literal=true 按纯文本搜索，或者修正正则',
-    });
-  }
-}
-
-export function sizeHint(bytes) {
-  return `${formatBytes(bytes)} (${bytes} bytes)`;
-}
-
-export function fileTooLargeError(file, size, { limitBytes, howTo }) {
-  return new ToolError(
-    `文件 ${toPosix(file)} 有 ${sizeHint(size)}，超过单次读取上限 ${sizeHint(limitBytes)}，已拒绝整读`,
-    {
-      code: 'E_TOO_LARGE',
-      hint:
-        `${howTo}\n` +
-        `  · 看尾部：tail path="..." lines=200\n` +
-        `  · 看开头：cat path="..." limit=200\n` +
-        `  · 定位关键行：grep path="..." pattern="ERROR"\n` +
-        `  · 分片继续：cat path="..." offset=<下次的 offset> limit=2000`,
+/**
+ * 定义一个只读工具。
+ * 声明式写法的唯一出口：注册表、只读校验、参数校验、耗时统计、审计都在这里统一处理。
+ */
+export function defineTool({ name, title, description, inputSchema, annotations = {}, run }) {
+  return {
+    name,
+    config: {
+      title,
+      description,
+      inputSchema,
+      // 只读工具的身份标识，写死在这里，任何人都改不掉
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, ...annotations },
     },
-  );
+    async execute(args, ctx) {
+      const parsed = inputSchema.safeParse(args ?? {});
+      if (!parsed.success) {
+        throw new ToolError(`参数不合法：${describeIssues(parsed.error)}`, {
+          code: 'E_PARAM',
+          hint: '按工具说明调整参数后重试；工具说明里每个参数都写了取值范围。',
+        });
+      }
+      const deadline = makeDeadline(ctx.config.callTimeoutMs);
+      const started = Date.now();
+      const out = await run(parsed.data, { ...ctx, deadline });
+      const elapsed = Date.now() - started;
+      if (out instanceof Out) {
+        out.set('ms', elapsed);
+        return { text: out.render(), elapsedMs: elapsed };
+      }
+      return { text: typeof out === 'string' ? out : JSON.stringify(out), elapsedMs: elapsed };
+    },
+  };
+}
+
+/** 工具报错统一转成 AI 能照着做的文本 */
+export function errorText(err) {
+  if (err instanceof ToolError) {
+    return `[error] ${err.code}: ${err.message}${err.hint ? `\n[hint] ${err.hint}` : ''}`;
+  }
+  return `[error] E_INTERNAL: ${err?.message || String(err)}`;
 }

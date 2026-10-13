@@ -1,18 +1,13 @@
 // cat：读文件内容。默认给行号，支持 offset/limit 分片续读。
-// 大文件不整读、二进制不硬灌、凭据类文件默认挡住 —— 而且每种拒绝都要给出「下一步怎么读」。
+// 大文件不整读、二进制不硬灌 —— 而且每种拒绝都要给出「下一步怎么读」。
 import fsp from 'node:fs/promises';
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 import { StringDecoder } from 'node:string_decoder';
-import { Out, bool, num, str } from './base.js';
+import { z } from 'zod';
+import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, toPosix } from '../util.js';
-import {
-  DEFAULT_MAX_LINE_CHARS,
-  readLinesRange,
-  readTailLines,
-  sniffBinary,
-  statFile,
-} from '../primitives.js';
+import { DEFAULT_MAX_LINE_CHARS, readLinesRange, readTailLines, sniffBinary, statFile } from '../primitives.js';
 
 // 单次最多吐这么多原始字节，同时是「超过就不整读」的门槛：
 // 1MB 文本约等于几十万 token，再大就不是给人看的了，必须让 AI 走 tail/grep/分片。
@@ -48,7 +43,7 @@ async function readTailPreview(file, size, ctx) {
   return tail.entries.map((e) => `  ${e.text}`);
 }
 
-/** gzip 日志：解压后按行取尾部（文件大小先设上限，避免解压炸弹） */
+/** gzip 日志：解压后按行取尾部（先设文件大小上限，避免解压炸弹） */
 export async function readGzipTail(file, { lines = 200, maxLineChars = DEFAULT_MAX_LINE_CHARS, signal } = {}) {
   const st = await statFile(file);
   if (st.size > 512 * 1024 * 1024) {
@@ -92,34 +87,24 @@ export async function streamLinesFromStream(stream, { maxLineChars = DEFAULT_MAX
   if (pending) onLine(pending.replace(/\r$/, ''));
 }
 
-export const catTool = {
+export const catTool = defineTool({
   name: 'cat',
   title: '读取文件内容',
   description:
-    '读文本文件内容（只读），输出带行号。默认读前 200 行；文件很大时不会整读，而是先给一段末尾预览。' +
-    '大文件请用 offset（字节偏移）+ limit 分片续读；只想看最新日志用 tail 更快。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径（绝对路径，或相对 project 的路径）' },
-      project: { type: 'string', description: '项目别名，来自 list_roots' },
-      offset: { type: 'integer', description: '起始字节偏移，默认 0；续读时用上一次返回的 nextOffset' },
-      limit: { type: 'integer', description: '最多返回多少行，默认 200，最大 20000' },
-      lineNumbers: { type: 'boolean', description: '是否输出行号，默认 true' },
-      maxLineChars: { type: 'integer', description: '单行最多输出多少字符，默认 4096' },
-    },
-    required: ['path'],
-    additionalProperties: false,
-  },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    '读文本文件内容（只读），输出带行号。默认读前 200 行；文件超过 1MB 且没指定 limit 时不会整读，' +
+    '而是先给一段末尾预览 + 后续读法。大文件请用 offset（字节偏移）+ limit 分片续读；只想看最新日志用 tail 更快。',
+  inputSchema: z.object({
+    path: z.string().min(1).describe('文件路径（绝对路径，或相对 project 的路径）'),
+    project: z.string().optional().describe('项目别名，来自 list_roots'),
+    offset: z.number().int().min(0).optional().describe('起始字节偏移，默认 0；续读时用上一次返回的 nextOffset'),
+    limit: z.number().int().min(1).max(20000).optional().describe('最多返回多少行，默认 200，最大 20000'),
+    lineNumbers: z.boolean().optional().describe('是否输出行号，默认 true'),
+    maxLineChars: z.number().int().min(80).max(100000).optional().describe('单行最多输出多少字符，默认 4096'),
+  }),
   async run(args, ctx) {
-    const project = str(args, 'project');
-    const p = str(args, 'path');
-    if (!p) throw new ToolError('必须传 path', { code: 'E_PARAM' });
-    const offset = num(args, 'offset', 0, { min: 0 });
-    const limit = num(args, 'limit', 200, { min: 1, max: 20000 });
-    const lineNumbers = bool(args, 'lineNumbers', true);
-    const maxLineChars = num(args, 'maxLineChars', DEFAULT_MAX_LINE_CHARS, { min: 80, max: 100000 });
+    const { path: p, project, offset = 0, lineNumbers = true, maxLineChars = DEFAULT_MAX_LINE_CHARS } = args;
+    const explicitLimit = args.limit !== undefined;
+    const limit = args.limit ?? 200;
 
     const target = await ctx.roots.resolveTarget(project, p);
     const allowed = await ctx.roots.checkAllowed(target.path);
@@ -150,7 +135,6 @@ export const catTool = {
     }
 
     // 「整读」才拦截：显式给了 limit 说明对方就是要一个分片，照给
-    const explicitLimit = args.limit !== undefined && args.limit !== null && args.limit !== '';
     if (offset === 0 && !explicitLimit && st.size > HARD_MAX_BYTES) {
       const preview = await readTailPreview(allowed.real, st.size, ctx);
       out.push('');
@@ -193,9 +177,7 @@ export const catTool = {
     out.set('lines', `${slice.lines[0].line}-${slice.lines[slice.lines.length - 1].line}`);
     if (!startInfo.exact) out.set('lineNumberNote', 'offset 较大，行号为估算');
     out.push('');
-    for (const l of slice.lines) {
-      out.push(lineNumbers ? `${l.line}| ${l.text}` : l.text);
-    }
+    for (const l of slice.lines) out.push(lineNumbers ? `${l.line}| ${l.text}` : l.text);
     out.push('');
 
     if (slice.stats.stoppedEarly) {
@@ -213,4 +195,6 @@ export const catTool = {
     }
     return out;
   },
-};
+});
+
+export { HARD_MAX_BYTES };

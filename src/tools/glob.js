@@ -1,7 +1,8 @@
 // glob_files：按名字找文件。比 ls depth 更直接的「把这个项目下所有 xxx.log 列出来」。
 import path from 'node:path';
 import fsp from 'node:fs/promises';
-import { Out, bool, num, str } from './base.js';
+import { z } from 'zod';
+import { Out, defineTool } from './base.js';
 import { ToolError, formatBytes, formatTime, makeNameMatcher, toPosix } from '../util.js';
 import { walkFiles } from '../walk.js';
 
@@ -20,39 +21,26 @@ async function newestOf(files, base) {
   return best;
 }
 
-export const globTool = {
+export const globTool = defineTool({
   name: 'glob_files',
   title: '按名字找文件',
   description:
     '按文件名通配符递归找文件（只读），例如 pattern="*.log"、"*2026-01*"、"*error*"。' +
     '只返回路径和大小，不返回内容——先定位，再用 tail/grep/cat 看内容。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      pattern: { type: 'string', description: '名字通配（支持 * ? {a,b}），如 "*.log" 或 "*error*"' },
-      path: { type: 'string', description: '从哪个目录开始找；默认项目根' },
-      project: { type: 'string', description: '项目别名，来自 list_roots' },
-      maxDepth: { type: 'integer', description: '递归深度，默认 6，最大 10' },
-      limit: { type: 'integer', description: '最多返回多少个文件，默认 200，最大 2000' },
-      includeHidden: { type: 'boolean', description: '是否包含隐藏文件/目录，默认 false' },
-    },
-    required: ['pattern'],
-    additionalProperties: false,
-  },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: z.object({
+    pattern: z.string().min(1).describe('名字通配（支持 * ? {a,b}），如 "*.log" 或 "*error*"'),
+    path: z.string().optional().describe('从哪个目录开始找；默认项目根'),
+    project: z.string().optional().describe('项目别名，来自 list_roots'),
+    maxDepth: z.number().int().min(1).max(10).optional().describe('递归深度，默认 6，最大 10'),
+    limit: z.number().int().min(1).max(2000).optional().describe('最多返回多少个文件，默认 200，最大 2000'),
+    includeHidden: z.boolean().optional().describe('是否包含隐藏文件/目录，默认 false'),
+  }),
   async run(args, ctx) {
-    const pattern = str(args, 'pattern');
-    if (!pattern) throw new ToolError('必须传 pattern', { code: 'E_PARAM' });
-    const project = str(args, 'project');
-    const relPath = str(args, 'path', '');
-    const maxDepth = num(args, 'maxDepth', 6, { min: 1, max: 10 });
-    const limit = num(args, 'limit', 200, { min: 1, max: 2000 });
-    const includeHidden = bool(args, 'includeHidden', false);
-
+    const { pattern, project, path: relPath = '', maxDepth = 6, limit = 200, includeHidden = false } = args;
     const matcher = makeNameMatcher(pattern);
 
     const out = new Out({ tool: 'glob_files', pattern }, { maxChars: ctx.config.maxTextChars });
-    const target = await ctx.roots.resolveTarget(project, relPath === undefined ? '' : relPath);
+    const target = await ctx.roots.resolveTarget(project, relPath);
     const allowed = await ctx.roots.checkAllowed(target.path);
     if (!allowed.exists) throw new ToolError(`路径不存在：${toPosix(allowed.abs)}`, { code: 'E_NOT_FOUND' });
     const st = await fsp.stat(allowed.real);
@@ -70,9 +58,7 @@ export const globTool = {
       : { files: [allowed.real], stopReason: null, dirsVisited: [allowed.real] };
 
     const rel = (f) => (st.isDirectory() ? toPosix(path.relative(allowed.real, f)) : toPosix(allowed.abs));
-    const hits = st.isDirectory()
-      ? walk.files.filter((f) => matcher(path.basename(f)) || matcher(rel(f)))
-      : [allowed.real];
+    const hits = st.isDirectory() ? walk.files.filter((f) => matcher(path.basename(f)) || matcher(rel(f))) : [allowed.real];
 
     out.set('found', hits.length);
     out.push('');
@@ -97,7 +83,7 @@ export const globTool = {
     if (hits.length >= limit || walk.stopReason) {
       out.push(
         `[hint] 结果可能被截断（${walk.stopReason || `匹配上限 limit=${limit}`}）。` +
-          `[action] 提高 limit、把 pattern 写精确，或指定更具体的 path。`,
+          '[action] 提高 limit、把 pattern 写精确，或指定更具体的 path。',
       );
     }
     if (st.isDirectory()) {
@@ -106,4 +92,4 @@ export const globTool = {
     }
     return out;
   },
-};
+});

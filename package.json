@@ -2,15 +2,16 @@
   "name": "fs-readonly-mcp",
   "version": "1.0.0",
   "private": true,
-  "description": "只读文件系统 MCP 服务（Streamable HTTP），给 AI 提供 ls / grep / cat / tail / stat / glob，零运行时依赖",
+  "description": "只读文件系统 MCP 服务（HTTP Streamable）：给 AI 提供 ls / grep / cat / tail / stat / glob，不允许任何写操作",
   "type": "module",
   "license": "UNLICENSED",
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20"
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/test.js"
+    "test": "node test/test.js",
+    "perf": "node test/perf.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "^2.0.2",
